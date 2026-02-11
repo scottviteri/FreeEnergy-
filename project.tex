@@ -1,0 +1,250 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\title{\textbf{Learning to Learn: Curriculum Selection via Reinforcement Learning for Sample-Efficient Language Models}}
+\author{Scott Viteri}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+We propose an algorithm that enables language models to learn what data to learn from. Rather than training on randomly sampled data, the model takes actions that select training examples, receiving reward based on how much each selection improves prediction on held-out data. The core hypothesis is that learned curriculum selection will yield significantly better sample efficiency than random or heuristic curricula.
+
+\section{Technical Approach}
+
+\subsection{Setup}
+
+\begin{itemize}[nosep]
+    \item Transformer with parameters $\theta$ and $L$ layers; write $f_\theta^{(\ell)}(x)$ for the residual-stream activation at layer $\ell$ and position of token $x$
+    \item Off-the-shelf embedding model $\phi \colon \text{text} \to \mathbb{R}^{d_\phi}$ for encoding streaming data
+    \item Streaming data source, partitioned into training candidates and held-out evaluation
+    \item Policy projections $W_\mu, W_\gamma \in \mathbb{R}^{d_\phi \times d}$ (output dimension matches $\phi$)
+    \item Learned state-dependent log-variance $\log \sigma^2 = W_\gamma z$
+    \item Discount factor $\gamma$; shared learning rate $\alpha$
+    \item Scalar Q-function $Q_\theta(x) = W_Q\, u_x \in \mathbb{R}$, a linear projection of the last-token activation of $x$
+\end{itemize}
+
+\subsection{Data Streaming}\label{sec:streaming}
+
+Data streams in continuously. For approximately every 1000 data points that arrive:
+\begin{itemize}[nosep]
+    \item $\sim$900 become training candidates (the set $S_t$ at outer step $t$)
+    \item $\sim$100 are reserved for held-out evaluation (the set $D_t$ at outer step $t$)
+\end{itemize}
+
+Each incoming data point $x$ is embedded via an off-the-shelf embedding model: $e_x = \phi(x)$. These embeddings are used for the selection mechanism described below.
+
+Each element of $S_t$ or $D_t$ is conceptually one full transformer context window of text.
+
+\subsection{Algorithm}
+
+At each outer-loop stream step $t$, we refresh $S_t, D_t$ from newly arrived data.  Candidates are sampled with replacement, so $|S_t|$ stays fixed throughout the inner loop.  We then run $K$ inner-loop steps (one per data point in Section~\ref{sec:streaming}) on fixed $S_t, D_t$ to update $\theta$.
+
+\begin{enumerate}[nosep]
+    \item \textbf{Select a training example.}
+    Let $z_k = f_{\theta_k}^{(L-1)}(\texttt{<s>})$ be the second-to-last residual-stream activation at the \texttt{<s>} token under the current weights $\theta_k$.
+    The Gaussian parameters in embedding space are:
+    \begin{align}
+        \mu_k &= W_\mu\, z_k \;\in\; \mathbb{R}^{d_\phi},\\
+        \log \sigma_k^2 &= W_\gamma\, z_k \;\in\; \mathbb{R}^{d_\phi}.
+    \end{align}
+    This Gaussian $\mathcal{N}(\mu_k, \operatorname{diag}(\sigma_k^2))$ over the embedding space induces a distribution over $S_t$ by normalising the density at each candidate's embedding:
+    \begin{equation}
+        \pi_{\theta_k}(x) = \frac{\mathcal{N}\!\bigl(\phi(x);\;\mu_k,\;\operatorname{diag}(\sigma_k^2)\bigr)}
+        {\sum_{x' \in S_t} \mathcal{N}\!\bigl(\phi(x');\;\mu_k,\;\operatorname{diag}(\sigma_k^2)\bigr)},
+        \qquad x \in S_t.
+    \end{equation}
+    We sample a single example $x_k \sim \pi_{\theta_k}$ (with replacement from $S_t$).
+
+    \item \textbf{Language-modeling update (state transition).}
+    \begin{equation}
+        \theta_{k+1} = \theta_k + \alpha\, \nabla_{\theta_k} \log p_{\theta_k}(x_k).
+    \end{equation}
+    This is the state transition of the MDP: the action $x_k$ determines how the weights change, and $\theta_{k+1}$ becomes the state for the next inner step.  We retain both $\theta_k$ and $\theta_{k+1}$ in memory.
+
+    \item \textbf{Reward.}
+    \begin{equation}
+        r_k = \frac{1}{|D_t|}\log p_{\theta_{k+1}}(D_t) - \frac{1}{|D_t|}\log p_{\theta_k}(D_t).
+    \end{equation}
+
+    \item \textbf{Q-value of selected example.}
+    The state in this MDP is $\theta_k$ and the action is $x_k$.
+    The Q-function estimates the \emph{discounted future expected return} from selecting $x_k$ in state $\theta_k$ and following the policy thereafter.
+    We obtain $u_k$ as a byproduct of the forward pass on $x_k$ under $\theta_{k+1}$ used to compute $\log p_{\theta_{k+1}}(D_t)$ in step~3 (specifically, $u_k = f_{\theta_{k+1}}^{(L-1)}(x_k^{\text{last}})$, the second-to-last residual-stream activation at the last token of $x_k$).  Then:
+    \begin{equation}
+        Q_{\theta_k}(x_k) = W_Q\, u_k \;\in\; \mathbb{R}.
+    \end{equation}
+
+    \item \textbf{Next-state value (Bellman target).}
+    We sample a batch of $M$ candidates $\{x^{(j)}\}_{j=1}^{M} \sim \pi_{\theta_{k+1}}$ from $S_t$ and estimate:
+    \begin{equation}
+        V_{k+1} \approx \frac{1}{M}\sum_{j=1}^{M} Q_{\theta_{k+1}}(x^{(j)}).
+    \end{equation}
+
+    \item \textbf{Baseline value.}
+    We sample a batch of $M$ candidates $\{x^{(j)}\}_{j=1}^{M} \sim \pi_{\theta_k}$ from $S_t$ and estimate:
+    \begin{equation}
+        V_k \approx \frac{1}{M}\sum_{j=1}^{M} Q_{\theta_k}(x^{(j)}).
+    \end{equation}
+    Since $W_Q$ is a single linear projection, evaluating $Q$ on each sampled candidate is cheap.
+
+    \item \textbf{Combined loss and update.}
+    The Bellman regression loss for the Q-function is:
+    \begin{align}
+        y_k &= r_k + \gamma\;\operatorname{sg}(V_{k+1}), \\
+        L_Q &= \bigl(Q_{\theta_k}(x_k) - y_k\bigr)^2,
+    \end{align}
+    where $\operatorname{sg}(\cdot)$ denotes stop-gradient: we do not back-propagate through $\theta_{k+1}$ or the $Q$ values in the target, but we \emph{do} back-propagate into $W_Q$ (and the backbone that produces $u_k$) on the left-hand side.
+
+    The policy-gradient loss uses the advantage $A_k = \operatorname{sg}\!\bigl(Q_{\theta_k}(x_k) - V_k\bigr)$:
+    \begin{equation}
+        L_\pi = -A_k \log \pi_{\theta_k}(x_k).
+    \end{equation}
+    Gradients of $L_\pi$ flow through $\pi_{\theta_k}(x_k)$ into $W_\mu$, $W_\gamma$, and the backbone (via $z_k$).
+
+    The total loss for one inner step is:
+    \begin{equation}
+    \boxed{\;L_k = L_Q + L_\pi\;}
+    \end{equation}
+    We compute $\nabla_{\theta_k} L_k$ and apply a single gradient step with learning rate $\alpha$, updating the shared parameters $\theta$ (backbone, $W_\mu$, $W_\gamma$, $W_Q$).  The language-modeling update (step~2) is applied separately as the MDP state transition.
+\end{enumerate}
+
+\subsection{Architecture}
+
+Let $L$ be the number of transformer layers.  All activations used by the policy and Q-function are read from the second-to-last residual-stream layer ($\ell = L-1$).
+
+\begin{itemize}[nosep]
+    \item \textbf{Policy state:} $z = f_\theta^{(L-1)}(\texttt{<s>}) \in \mathbb{R}^{d}$, the activation at the start token.
+    \item \textbf{Policy head:} $\mu = W_\mu\, z \in \mathbb{R}^{d_\phi}$, $\log \sigma^2 = W_\gamma\, z \in \mathbb{R}^{d_\phi}$.  The Gaussian $\mathcal{N}(\mu, \operatorname{diag}(\sigma^2))$ in embedding space is normalised over $S_t$ to give $\pi_\theta(x)$.
+    \item \textbf{Q head:} $Q_\theta(x) = W_Q\, u_x \in \mathbb{R}$, where $u_x = f_\theta^{(L-1)}(x^{\text{last}})$ is the activation at the last token of context window $x$.
+\end{itemize}
+
+The state-value baseline $V$ is estimated by sampling $M$ candidates from $\pi$ and averaging their $Q$ values, yielding the advantage $A = Q_\theta(x) - V$.
+
+\section{Evaluation}
+
+\subsection{Primary Metric: Sample Efficiency}
+
+The central question is: how many training examples does the model need to reach a given performance level?
+
+We will measure:
+\begin{itemize}[nosep]
+    \item Perplexity on a fixed evaluation set as a function of training examples seen
+    \item Performance on downstream tasks (e.g., MMLU, HellaSwag) as a function of training examples
+    \item Comparison to human learning efficiency as an aspirational benchmark
+\end{itemize}
+
+\subsection{Baselines}
+
+\begin{itemize}[nosep]
+    \item \textbf{Random curriculum:} Uniform sampling from candidates
+    \item \textbf{Loss-based curriculum:} Prioritize high-loss examples
+    \item \textbf{Uncertainty-based curriculum:} Prioritize examples with high model uncertainty
+    \item \textbf{Competence-based curriculum:} Examples ordered by difficulty (requires difficulty labels)
+\end{itemize}
+
+\subsection{Analysis}
+
+Beyond aggregate metrics, we will examine:
+\begin{itemize}[nosep]
+    \item \textbf{Curriculum structure:} Does the learned curriculum exhibit interpretable patterns? Developmental stages? Topic clustering?
+    \item \textbf{Exploration dynamics:} How does $\sigma$ evolve over training? Does the learned variance produce reasonable exploration?
+    \item \textbf{Q-function interpretability:} What does $Q_\theta(x)$ learn to predict? Can we understand what makes a training example ``valuable''?
+\end{itemize}
+
+\section{Relation to Prior Work}
+
+\subsection{Curriculum Learning}
+
+Graves et al.\ (2017) use multi-armed bandits to select tasks; Jiang et al.\ (2018) train a separate ``mentor'' network to weight examples. Our approach differs by embedding selection in the model's forward pass and using RL to optimize for held-out improvement directly.
+
+\subsection{Meta-Learning}
+
+MAML (Finn et al., 2017) learns initializations for fast adaptation. We share the computational structure---reasoning about the effect of gradient updates---but learn \emph{what} to train on rather than \emph{where} to start.
+
+\subsection{Intrinsic Motivation}
+
+Our objective relates to compression progress (Schmidhuber) and active inference, but avoids the memory requirements of the former and the dark room problem of the latter by using streaming held-out data as a proxy for predictive success.
+
+\subsection{Connection to My Prior Work}
+
+This proposal builds directly on my recent work on Markovian Transformers for Informative Language Modeling (\url{https://arxiv.org/abs/2404.18988}). That work introduces a framework for training language models to generate Chain-of-Thought reasoning that is \emph{causally load-bearing}---the CoT must contain all information needed to predict the answer, as the model cannot attend back to the original question.
+
+Both projects share a common structure: use RL to learn intermediate representations that improve prediction on held-out data. In the Markovian Transformers work, we learn CoTs:
+\[
+\text{Question} \to \text{CoT} \to \text{Answer}
+\]
+In the current proposal, we learn curricula:
+\[
+\text{Model State} \to \text{Selected Data} \to \text{Improved Predictions}
+\]
+
+The Markovian Transformers work demonstrates that this general approach is tractable and yields large gains on reasoning benchmarks (e.g., GSM8K: 19.6\% $\to$ 57.1\%). The current proposal extends this framework from learning \emph{what to say} to learning \emph{what to study}.
+
+\section{Broader Motivation}
+
+Language models trained to predict text develop remarkable capabilities from a simple objective. Yet they require extensive post-training to behave agentically and arguably lack a kind of global coherence. One hypothesis: the training process is purely observational---the model never takes actions that affect what it observes.
+
+This project is a stepping stone toward studying whether learned curriculum selection produces qualitatively different agents. The immediate goal is demonstrating sample efficiency gains. The longer-term question is whether controlling one's own learning process contributes to the coherence and agency that current models seem to lack.
+
+\subsection{Long-Term Direction: Formalizing Homeostasis}
+
+Biological agents are shaped by survival pressures. Hunger, pain, and fatigue are not arbitrary reward signals---they are tied to the organism's continued existence. Current approaches to intrinsic motivation (curiosity, empowerment, compression progress) capture aspects of adaptive behavior but lack this grounding in self-preservation.
+
+A long-term goal of this research program is to formalize homeostasis and survival into a simple, biologically plausible metric that could serve as a foundation for intrinsic motivation in artificial systems. The current project---learning to select data that improves future prediction---is a minimal step in this direction: the agent takes actions that maintain its predictive capacity, a kind of epistemic homeostasis. Understanding what this simple case yields will inform more ambitious formulations.
+
+\section{Timeline and Resources}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Phase} & \textbf{Duration} \\
+\midrule
+Infrastructure and baseline implementation & 6 weeks \\
+Core algorithm implementation and debugging & 8 weeks \\
+Initial experiments and hyperparameter tuning & 6 weeks \\
+Scaling experiments on larger models & 4 weeks \\
+Analysis and writeup & 4 weeks \\
+\midrule
+\textbf{Total} & \textbf{6 months} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Compute Resources}
+
+\begin{itemize}[nosep]
+    \item \textbf{Initial experiments:} Stanford Sherlock cluster (covered by existing allocation)
+    \item \textbf{Final scaling experiments:} Cloud compute (Runpod or similar), approximately \$10K for H100/H200 time to validate results on larger models (1B+ parameters)
+\end{itemize}
+
+\section{Expected Outcomes}
+
+\begin{enumerate}[nosep]
+    \item Empirical demonstration of sample efficiency gains (or well-documented negative result)
+    \item Open-source implementation of the algorithm
+    \item Analysis of learned curriculum structure
+    \item Foundation for future work on agency, homeostasis, and learned exploration in language models
+\end{enumerate}
+
+\section{About the Applicant}
+
+Scott Viteri is a final-year PhD student at Stanford working on machine learning and reinforcement learning, with a focus on continual learning in transformers. His relevant prior work includes:
+
+\begin{itemize}[nosep]
+    \item \textbf{Markovian Transformers for Informative Language Modeling} (\url{https://arxiv.org/abs/2404.18988}): Introduces a framework for training language models with RL to produce causally load-bearing Chain-of-Thought reasoning. Demonstrates large gains on reasoning benchmarks (GSM8K, ARC-Challenge, MMLU). This work establishes the technical foundation for the current proposal.
+    \item \textbf{Epistemic Phase Transitions in Mathematical Proofs} (Cognition, 2022): Studies how belief formation operates in mathematical reasoning using network models, showing how modular structure and bidirectional inference enable certainty to emerge despite local error rates.
+    \item \textbf{ARC Eliciting Latent Knowledge Prize winner}: Recognized for work on methods to extract truthful information from language models.
+    \item Experience with category-theoretic approaches to machine learning, collaborating with researchers at the Topos Institute.
+\end{itemize}
+
+\end{document}
