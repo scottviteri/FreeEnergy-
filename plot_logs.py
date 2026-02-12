@@ -681,7 +681,79 @@ def plot_selection_per_outer(steps, evals, out_dir):
 # Main loop
 # ---------------------------------------------------------------------------
 
+def plot_dashboard(steps, evals, out_dir):
+    """All-in-one 4x4 dashboard: 16 panels in a single image."""
+    fig, axes = plt.subplots(4, 4, figsize=(28, 20))
+    fig.suptitle("Training Dashboard", fontsize=18, fontweight="bold")
+
+    win = lambda ys: min(30, max(1, len(ys) // 10))
+
+    def _plot(ax, key, title, color="C0", src="steps", log_y=False, hline=None):
+        if src == "steps":
+            xs, ys = get(steps, key)
+        else:
+            xs, ys = get_eval(evals, key)
+        if not xs:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes, ha="center", color="gray")
+            ax.set_title(title, fontsize=9)
+            return
+        if src == "eval":
+            ax.plot(xs, ys, "o-", color=color, markersize=2, linewidth=1)
+        else:
+            ax.plot(xs, ys, alpha=0.2, color=color, linewidth=0.4)
+            if len(ys) > 5:
+                sx, sy = smooth_xy(xs, ys, win(ys))
+                ax.plot(sx, sy, color=color, linewidth=1.5)
+        if hline is not None:
+            ax.axhline(hline, color="gray", linestyle="--", linewidth=0.5)
+        if log_y:
+            ax.set_yscale("log")
+        ax.set_title(title, fontsize=9)
+        ax.tick_params(labelsize=7)
+
+    # Row 0: core metrics
+    _plot(axes[0, 0], "r_k", "Reward (scaled r_k)", "C0", hline=0)
+    _plot(axes[0, 1], "cumulative_reward", "Cumulative Reward (raw)", "C3")
+    _plot(axes[0, 2], "heldout_lp", "Held-out Log-Prob", "C1")
+    _plot(axes[0, 3], "lm_loss", "LM Loss (selected x_k)", "C2")
+
+    # Row 1: eval + RL values
+    _plot(axes[1, 0], "perplexity", "Eval Perplexity", "C4", src="eval")
+    _plot(axes[1, 1], "q_xk", "Q(x_k)", "C0", hline=0)
+    _plot(axes[1, 2], "A_k", "Advantage A_k", "C3", hline=0)
+    _plot(axes[1, 3], "V_k", "Baseline V_k", "C1")
+
+    # Row 2: losses + grad norms
+    _plot(axes[2, 0], "L_Q", "Bellman Loss L_Q", "C0", log_y=True)
+    _plot(axes[2, 1], "L_pi", "Policy Loss L_pi", "C1")
+    _plot(axes[2, 2], "lm_grad_total", "LM Grad Norm", "C0", log_y=True)
+    _plot(axes[2, 3], "rl_grad_total", "RL Grad Norm", "C3", log_y=True)
+
+    # Row 3: policy + timing + weights
+    _plot(axes[3, 0], "pi_entropy", "Policy Entropy H(pi)", "C0")
+    _plot(axes[3, 1], "pi_effective_n", "Effective N = exp(H)", "C1")
+    _plot(axes[3, 2], "step_time", "Step Time (s)", "C2")
+
+    # Weight norms (multiple lines)
+    ax = axes[3, 3]
+    for key, label, color in [
+        ("wnorm_W_mu", "W_mu", "C0"),
+        ("wnorm_W_Q", "W_Q", "C2"),
+    ]:
+        xs, ys = get(steps, key)
+        if xs:
+            ax.plot(xs, ys, linewidth=1, color=color, label=label)
+    ax.set_title("Weight Norms", fontsize=9)
+    ax.legend(fontsize=6)
+    ax.tick_params(labelsize=7)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_dir / "00_dashboard.png", dpi=150)
+    plt.close(fig)
+
+
 ALL_PLOTTERS = [
+    plot_dashboard,
     plot_core_metrics,
     plot_eval_perplexity,
     plot_rl_losses,

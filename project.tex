@@ -113,11 +113,16 @@ At each outer-loop stream step $t$, we refresh $S_t, D_t$ from newly arrived dat
     \end{equation}
     Gradients of $L_\pi$ flow through $\pi_{\theta_k}(x_k)$ into $W_\mu$, $W_\gamma$, and the backbone (via $z_k$).
 
+    \textbf{Implementation note.}
+    Computing $L_\pi$ requires $\nabla_{\theta_k} \log \pi_{\theta_k}(x_k)$, but $A_k$ is only available after the LM step (step~2) has advanced parameters to $\theta_{k+1}$.
+    The implementation resolves this by snapshotting $\theta_k$ before the LM step.
+    $L_Q$ is computed at $\theta_{k+1}$ (since $u_k = f_{\theta_{k+1}}^{(L-1)}(x_k^{\text{last}})$), then $\theta_k$ is temporarily restored to compute $\nabla_{\theta_k} L_\pi$ exactly, and finally $\theta_{k+1}$ is restored before the combined gradient step.
+
     The total loss for one inner step is:
     \begin{equation}
     \boxed{\;L_k = L_Q + L_\pi\;}
     \end{equation}
-    We compute $\nabla_{\theta_k} L_k$ and apply a single gradient step with learning rate $\alpha$, updating the shared parameters $\theta$ (backbone, $W_\mu$, $W_\gamma$, $W_Q$).  The language-modeling update (step~2) is applied separately as the MDP state transition.
+    The gradient $\nabla L_Q$ is evaluated at $\theta_{k+1}$ and $\nabla L_\pi$ at $\theta_k$; both are summed and applied as a single update to $\theta_{k+1}$.  The language-modeling update (step~2) is applied separately as the MDP state transition.
 \end{enumerate}
 
 \subsection{Architecture}

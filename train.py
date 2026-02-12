@@ -41,29 +41,30 @@ class Config:
 
     # Data streaming
     num_candidates: int = 900  # |S_t|
-    num_heldout: int = 100     # |D_t|
+    num_heldout: int = 400     # |D_t|
     outer_steps: int = 200     # number of outer-loop stream steps
-    inner_steps: int = 100     # K inner-loop steps per outer step
+    inner_steps: int = 200     # K inner-loop steps per outer step
 
     # RL
     gamma: float = 0.99        # discount factor
     lr: float = 1e-4           # shared learning rate alpha
-    M: int = 16                # number of samples for V estimation
+    M: int = 64                # number of samples for V estimation
 
     # Stability
     grad_clip: float = 1.0     # max gradient norm (0 = no clipping)
     fix_sigma: bool = True     # if True, sigma^2 = 1 (W_gamma ignored)
     policy_temp: float = 0.0   # temperature for policy logits (0 = auto: 1/d_phi)
+    reward_scale: float = 1000.0  # multiply r_k by this; raw r_k ~ O(0.001) so 1000 -> O(1)
 
     # Curriculum mode
     curriculum: str = "rl"     # "rl" | "random" | "loss" | "uncertainty"
 
     # Eval
     num_eval_windows: int = 200  # fixed eval set size for perplexity tracking
-    eval_every_outer: int = 1    # evaluate every N outer steps
+    eval_every_outer: int = 5    # evaluate every N outer steps
 
     # Batching (0 = all-at-once; set lower if OOM)
-    batch_size: int = 0          # max examples per GPU forward pass
+    batch_size: int = 200        # max examples per GPU forward pass
 
     # Checkpointing
     save_every_outer: int = 0    # save model every N outer steps (0 = never)
@@ -589,6 +590,42 @@ def _gpu_stats() -> dict:
     }
 
 
+def _sync():
+    """Synchronize CUDA for accurate timing."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Reward normalization
+# ---------------------------------------------------------------------------
+
+class RewardNormalizer:
+    """Welford online estimator of reward std for normalization."""
+
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+
+    def update(self, r: float):
+        self.n += 1
+        delta = r - self.mean
+        self.mean += delta / self.n
+        delta2 = r - self.mean
+        self.M2 += delta * delta2
+
+    @property
+    def std(self) -> float:
+        if self.n < 2:
+            return 1.0
+        return math.sqrt(self.M2 / (self.n - 1)) or 1.0
+
+    def normalize(self, r: float) -> float:
+        """Return r / running_std (mean is NOT subtracted — we want sign preserved)."""
+        return r / self.std
+
+
 # ---------------------------------------------------------------------------
 # Evaluation: perplexity on a fixed set
 # ---------------------------------------------------------------------------
@@ -644,6 +681,8 @@ def train(cfg: Config):
     eval_ids = _tokens_to_tensor(eval_tokens_list, device)  # (num_eval, T) on GPU
     init_ppl = evaluate_perplexity(model, eval_ids, device, batch_size=cfg.batch_size)
     logging.info("Initial eval perplexity: %.2f", init_ppl)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()  # free fragmented memory from init eval
 
     # --- Logging ---
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
@@ -672,6 +711,9 @@ def train(cfg: Config):
     else:
         policy_temp = float(cfg.d_phi)  # auto: divide by d_phi
     logging.info("Policy temperature: %.1f  (d_phi=%d)", policy_temp, cfg.d_phi)
+
+    # Reward scaling
+    logging.info("Reward scale: %.1f  (raw r_k * scale -> RL reward)", cfg.reward_scale)
 
     total_examples_seen = 0
     cumulative_reward = 0.0
@@ -706,7 +748,7 @@ def train(cfg: Config):
             # ==============================================================
             # Step 1: Select a training example
             # ==============================================================
-            t0 = time.time()
+            _sync(); t0 = time.time()
             if cfg.curriculum == "rl":
                 idx_k, log_pi_k, z_k, mu_k, log_sigma2_k = _rl_select(
                     model, E_S, device, fix_sigma=cfg.fix_sigma,
@@ -720,7 +762,7 @@ def train(cfg: Config):
                 idx_k = select_uncertainty_based(model, S_t_tokens, device)
             else:
                 raise ValueError(f"Unknown curriculum: {cfg.curriculum}")
-            timings["t_select"] = round(time.time() - t0, 4)
+            _sync(); timings["t_select"] = round(time.time() - t0, 4)
 
             x_k_tokens = S_t_tokens[idx_k]
             x_k_text_snippet = tokenizer.decode(x_k_tokens[:60]).replace("\n", " ")[:200]
@@ -733,19 +775,28 @@ def train(cfg: Config):
             # ==============================================================
             V_k_val = None
             if cfg.curriculum == "rl":
-                t0 = time.time()
+                _sync(); t0 = time.time()
                 sample_indices_k = sample_M_from_pi(log_pi_k.detach(), cfg.M)
                 sampled_tokens_k = [S_t_tokens[i] for i in sample_indices_k]
                 with torch.no_grad():
-                    q_samples_k = compute_q_values(model, sampled_tokens_k, device, batch_size=cfg.batch_size)
+                    q_samples_k = compute_q_values(model, sampled_tokens_k, device, batch_size=cfg.M)
                     V_k_val = q_samples_k.mean().item()
-                timings["t_V_k"] = round(time.time() - t0, 4)
+                _sync(); timings["t_V_k"] = round(time.time() - t0, 4)
 
             # ==============================================================
             # Step 2: Language-modeling update (MDP state transition)
             #   theta_{k+1} = theta_k + alpha * grad log p(x_k)
             # ==============================================================
-            t0 = time.time()
+            _sync(); t0 = time.time()
+
+            # Snapshot theta_k so we can evaluate log pi_{theta_k} exactly
+            # in the RL update (Step 7) after the LM step mutates params.
+            theta_k_snapshot = None
+            if cfg.curriculum == "rl":
+                theta_k_snapshot = {
+                    n: p.data.clone() for n, p in model.named_parameters()
+                }
+
             input_ids_xk = torch.tensor([x_k_tokens], device=device)
             lm_logp, _ = model.forward_lm(input_ids_xk)
             lm_loss = -lm_logp  # minimise negative log-prob
@@ -760,24 +811,27 @@ def train(cfg: Config):
             if cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
-            timings["t_lm_update"] = round(time.time() - t0, 4)
+            _sync(); timings["t_lm_update"] = round(time.time() - t0, 4)
             # model now holds theta_{k+1}
 
             # ==============================================================
             # Step 3: Reward  r_k = mean_lp(D, theta_{k+1}) - mean_lp(D, theta_k)
             # ==============================================================
-            t0 = time.time()
+            _sync(); t0 = time.time()
             new_heldout_lp = mean_log_prob_dataset(model, D_t_ids, device, batch_size=cfg.batch_size)
-            r_k = new_heldout_lp - prev_heldout_lp
-            cumulative_reward += r_k
-            timings["t_reward"] = round(time.time() - t0, 4)
+            r_k_raw = new_heldout_lp - prev_heldout_lp
+            cumulative_reward += r_k_raw
+            r_k = r_k_raw * cfg.reward_scale
+            _sync(); timings["t_reward"] = round(time.time() - t0, 4)
 
             # ==============================================================
             # Steps 4-7: RL loss (only in RL curriculum mode)
+            # Skip inner_step=0: the first reward after a dataset refresh
+            # has no prior baseline on this D_t, so it's noisier.
             # ==============================================================
             rl_stats = {}
-            if cfg.curriculum == "rl":
-                t0 = time.time()
+            if cfg.curriculum == "rl" and k > 0:
+                _sync(); t0 = time.time()
                 rl_stats = _rl_update(
                     model=model,
                     optimizer=optimizer,
@@ -789,10 +843,11 @@ def train(cfg: Config):
                     idx_k=idx_k,
                     r_k=r_k,
                     V_k=V_k_val,
+                    theta_k_snapshot=theta_k_snapshot,
                     fix_sigma=cfg.fix_sigma,
                     temperature=policy_temp,
                 )
-                timings["t_rl_total"] = round(time.time() - t0, 4)
+                _sync(); timings["t_rl_total"] = round(time.time() - t0, 4)
 
             # Update cached held-out log-prob for next step
             prev_heldout_lp = new_heldout_lp
@@ -815,6 +870,7 @@ def train(cfg: Config):
                     "selected_idx": idx_k,
                     "selected_text": x_k_text_snippet,
                     # -- Core metrics --
+                    "r_k_raw": r_k_raw,
                     "r_k": r_k,
                     "cumulative_reward": cumulative_reward,
                     "heldout_lp": new_heldout_lp,
@@ -917,6 +973,7 @@ def _rl_update(
     idx_k: int,
     r_k: float,
     V_k: float,
+    theta_k_snapshot: dict[str, torch.Tensor],
     fix_sigma: bool = False,
     temperature: float = 1.0,
 ) -> dict:
@@ -931,27 +988,27 @@ def _rl_update(
     step, while the model is still at theta_k.  This ensures V_k reflects
     the state in which the action was selected, as the paper specifies.
 
+    theta_k_snapshot is a dict {name: tensor} of parameter values at theta_k,
+    snapshotted before the LM step.  We temporarily load these into the model
+    to compute the exact policy gradient nabla_{theta_k} log pi_{theta_k}(x_k).
+
     The paper specifies:
       - Q_{theta_k}(x_k) = W_Q * u_k  where u_k = f_{theta_{k+1}}^{(L-1)}(x_k^last)
         (eq 6: Q uses W_Q but u_k comes from theta_{k+1} forward pass)
       - The Bellman loss LHS is Q_{theta_k}(x_k), target is r_k + gamma * sg(V_{k+1})
       - The policy loss uses advantage A_k = sg(Q_{theta_k}(x_k) - V_k)
-      - Gradients of L_k flow into W_mu, W_gamma, W_Q, and the backbone
-
-    Implementation notes:
-      We are at theta_{k+1}.  We compute u_k (hidden for x_k) under theta_{k+1}
-      and Q(x_k) = W_Q @ u_k.  V_{k+1} is computed under theta_{k+1} (correct).
-      V_k was computed under theta_k before the LM step (correct).
+      - Gradients of L_Q flow through W_Q and the backbone at theta_{k+1}
+      - Gradients of L_pi flow through W_mu, W_gamma, and the backbone at theta_k
     """
     # ---- Step 4: Q-value of selected example under theta_{k+1} ----
-    t0 = time.time()
+    _sync(); t0 = time.time()
     input_ids_xk = torch.tensor([x_k_tokens], device=device)
     _, h_last_k = model.forward_lm(input_ids_xk)  # u_k under theta_{k+1}
     q_xk = model.q_value(h_last_k.squeeze(0))      # scalar, has grad
-    dt_q_xk = time.time() - t0
+    _sync(); dt_q_xk = time.time() - t0
 
     # ---- Step 5: Next-state value V_{k+1} ----
-    t0 = time.time()
+    _sync(); t0 = time.time()
     z_kp1 = model.get_policy_state(device)
     mu_kp1, log_sigma2_kp1 = model.policy_params(z_kp1)
     log_pi_kp1 = compute_log_pi(mu_kp1, log_sigma2_kp1, E_S, fix_sigma=fix_sigma,
@@ -962,43 +1019,77 @@ def _rl_update(
     with torch.no_grad():
         q_samples_kp1 = compute_q_values(model, sampled_tokens_kp1, device, batch_size=cfg.M)
         V_kp1 = q_samples_kp1.mean()
-    dt_V_kp1 = time.time() - t0
+    _sync(); dt_V_kp1 = time.time() - t0
 
     # ---- Step 6: Baseline value V_k (pre-computed under theta_k) ----
     # V_k was computed in the main loop before the LM step, passed in as a float.
 
     # ---- Step 7: Combined loss ----
-    t0 = time.time()
+    # We compute L_Q and L_pi in two phases because they use different parameter
+    # values: L_Q uses theta_{k+1} (current), L_pi uses theta_k (snapshot).
+
+    # -- Phase A: L_Q at theta_{k+1} --
+    _sync(); t0 = time.time()
     # Bellman target (stop-gradient)
     y_k = r_k + cfg.gamma * V_kp1.item()
     L_Q = (q_xk - y_k) ** 2
 
-    # Policy log-prob under current params (has grad through W_mu, W_gamma, backbone)
+    # Advantage (stop-gradient); needed for L_pi magnitude
+    A_k = q_xk.detach().item() - V_k
+
+    # Compute and stash L_Q gradients at theta_{k+1}
+    optimizer.zero_grad()
+    L_Q.backward()
+    q_grad_snapshot = {
+        n: p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+        for n, p in model.named_parameters()
+    }
+
+    # -- Phase B: L_pi at theta_k (exact) --
+    # Temporarily load theta_k into the model so that the forward pass and
+    # autograd produce nabla_{theta_k} log pi_{theta_k}(x_k).
+    theta_kp1_snapshot = {
+        n: p.data.clone() for n, p in model.named_parameters()
+    }
+    for n, p in model.named_parameters():
+        p.data.copy_(theta_k_snapshot[n])
+
+    # Forward pass at theta_k to build a live computation graph
     z_k_pg = model.get_policy_state(device)
     mu_k_pg, log_sigma2_k_pg = model.policy_params(z_k_pg)
     log_pi_k_pg = compute_log_pi(mu_k_pg, log_sigma2_k_pg, E_S, fix_sigma=fix_sigma,
                                 temperature=temperature)
 
-    # Advantage (stop-gradient)
-    A_k = q_xk.detach().item() - V_k
-
     L_pi = -A_k * log_pi_k_pg[idx_k]
 
-    L_k = L_Q + L_pi
-
     optimizer.zero_grad()
-    L_k.backward()
+    L_pi.backward()  # gradients are now nabla_{theta_k} L_pi
+
+    # -- Combine: add L_Q grads (from theta_{k+1}) to L_pi grads (from theta_k) --
+    for n, p in model.named_parameters():
+        if p.grad is not None:
+            p.grad.add_(q_grad_snapshot[n])
+        else:
+            p.grad = q_grad_snapshot[n].clone()
+
     rl_grad_stats = _grad_norm(model)
     rl_grad_total = math.sqrt(sum(
         p.grad.detach().norm().item()**2
         for p in model.parameters() if p.grad is not None
     ))
+
+    # Restore theta_{k+1} before applying the RL gradient step.
+    # The optimizer step will update from theta_{k+1} using the combined gradient.
+    for n, p in model.named_parameters():
+        p.data.copy_(theta_kp1_snapshot[n])
+
     if cfg.grad_clip > 0:
         nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     optimizer.step()
-    dt_pg_step = time.time() - t0
+    _sync(); dt_pg_step = time.time() - t0
 
-    # Policy distribution diagnostics
+    # Policy distribution diagnostics (from the theta_k policy, which is what
+    # the algorithm actually uses for selection)
     pol_stats = _policy_stats(log_pi_k_pg, log_sigma2_k_pg, fix_sigma=fix_sigma)
 
     # Bellman TD error
@@ -1015,7 +1106,7 @@ def _rl_update(
         # -- Losses --
         "L_Q": L_Q.item(),
         "L_pi": L_pi.item(),
-        "L_k": L_k.item(),
+        "L_k": L_Q.item() + L_pi.item(),
         # -- RL gradient norms --
         "rl_grad_total": rl_grad_total,
         **{f"rl_{k2}": v for k2, v in rl_grad_stats.items()},
