@@ -1,9 +1,19 @@
 """
-Curriculum Selection via Reinforcement Learning for Sample-Efficient Language Models.
+Free-Energy Curriculum Selection via Fitted Soft Values.
 
-Implementation of the algorithm described in project.pdf / project.tex.
-Uses GPT-2 (small) as the transformer and either OpenAI text-embedding-3-small
-or a local sentence-transformers model as the embedding function phi.
+Simplified formulation: the policy over training candidates is the Boltzmann
+distribution pi(x) = softmax(w . phi(x) / beta) where w is a learned value
+vector in embedding space, updated by online regression toward observed
+one-step held-out improvements.
+
+The algorithm alternates two steps (coordinate descent on the free energy):
+  M-step: train on selected example   theta <- theta + alpha * grad log p(x_k)
+  E-step: regress value vector         w <- w - eta * (w . phi(x_k) - r_k) * phi(x_k)
+
+No Q-function, no V baseline, no Bellman loss, no parameter snapshots.
+
+Uses GPT-2 (small) as the transformer and a local sentence-transformers model
+as the embedding function phi.
 """
 
 import os
@@ -45,19 +55,17 @@ class Config:
     outer_steps: int = 200     # number of outer-loop stream steps
     inner_steps: int = 200     # K inner-loop steps per outer step
 
-    # RL
-    gamma: float = 0.99        # discount factor
-    lr: float = 1e-4           # shared learning rate alpha
-    M: int = 64                # number of samples for V estimation
+    # Free-energy / soft-value parameters
+    beta: float = 1.0          # Boltzmann temperature (higher = more exploration)
+    value_lr: float = 0.01     # learning rate eta for value vector regression
+    reward_scale: float = 1000.0  # multiply raw r_k; raw r_k ~ O(0.001)
 
-    # Stability
+    # LM training
+    lr: float = 1e-4           # learning rate alpha for LM gradient step
     grad_clip: float = 1.0     # max gradient norm (0 = no clipping)
-    fix_sigma: bool = True     # if True, sigma^2 = 1 (W_gamma ignored)
-    policy_temp: float = 0.0   # temperature for policy logits (0 = auto: 1/d_phi)
-    reward_scale: float = 1000.0  # multiply r_k by this; raw r_k ~ O(0.001) so 1000 -> O(1)
 
     # Curriculum mode
-    curriculum: str = "rl"     # "rl" | "random" | "loss" | "uncertainty"
+    curriculum: str = "rl"     # "rl" (free-energy) | "random" | "loss" | "uncertainty"
 
     # Eval
     num_eval_windows: int = 200  # fixed eval set size for perplexity tracking
@@ -82,7 +90,7 @@ class Config:
 def config_from_args() -> Config:
     """Parse command-line arguments into a Config."""
     cfg = Config()
-    parser = argparse.ArgumentParser(description="Curriculum RL Training")
+    parser = argparse.ArgumentParser(description="Free-Energy Curriculum Training")
     for k, v in cfg.__dict__.items():
         if isinstance(v, bool):
             parser.add_argument(f"--{k}", action="store_true", default=v)
@@ -175,7 +183,6 @@ class OpenAIEmbedder:
         self.client = openai.OpenAI()  # uses OPENAI_API_KEY env var
         self.cache: dict[str, list[float]] = {}
         self._load_cache()
-        # Probe dimension
         resp = self.client.embeddings.create(
             model=cfg.embedding_model_openai, input=["dimension probe"]
         )
@@ -196,18 +203,15 @@ class OpenAIEmbedder:
     def embed_batch(self, token_id_lists: list[list[int]]) -> torch.Tensor:
         texts = [self.tokenizer.decode(ids) for ids in token_id_lists]
         keys = [t[:128] for t in texts]
-
         miss_indices = [i for i, k in enumerate(keys) if k not in self.cache]
         if miss_indices:
             miss_texts = [texts[i] for i in miss_indices]
             response = self.client.embeddings.create(
-                model=self.cfg.embedding_model_openai,
-                input=miss_texts,
+                model=self.cfg.embedding_model_openai, input=miss_texts,
             )
             for idx, emb_obj in zip(miss_indices, response.data):
                 self.cache[keys[idx]] = emb_obj.embedding
             self._save_cache()
-
         embeddings = [self.cache[k] for k in keys]
         return torch.tensor(embeddings, dtype=torch.float32)
 
@@ -225,72 +229,31 @@ def make_embedder(cfg: Config, tokenizer: GPT2Tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Model: GPT-2 + policy / Q heads
+# Model: GPT-2 (language model only — no RL heads)
 # ---------------------------------------------------------------------------
 
 class CurriculumGPT2(nn.Module):
     """
-    GPT-2 backbone with three extra linear heads:
-      - W_mu:    d -> d_phi   (policy mean)
-      - W_gamma: d -> d_phi   (policy log-variance)
-      - W_Q:     d -> 1       (Q-value)
+    GPT-2 backbone for language modeling.  No policy or Q-value heads;
+    the selection policy is parameterized by a separate value vector w
+    in embedding space (not part of this module).
     """
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
-
-        # Load pretrained GPT-2
         self.gpt2 = GPT2LMHeadModel.from_pretrained(cfg.model_name)
         self.tokenizer = GPT2Tokenizer.from_pretrained(cfg.model_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        d_model = self.gpt2.config.n_embd  # 768 for gpt2
-        n_layers = self.gpt2.config.n_layer  # 12 for gpt2
-
-        # Second-to-last layer: paper calls this ell = L-1 (1-indexed).
-        # In 0-indexed terms this is layer (n_layers - 2), i.e. index 10 for GPT-2.
-        self.hook_layer = n_layers - 2
-
-        # Projection heads (d_phi must be set before calling this)
-        assert cfg.d_phi > 0, "cfg.d_phi must be set before constructing CurriculumGPT2"
-        self.W_mu = nn.Linear(d_model, cfg.d_phi, bias=False)
-        self.W_gamma = nn.Linear(d_model, cfg.d_phi, bias=False)
-        self.W_Q = nn.Linear(d_model, 1, bias=False)
-
-        # Init heads small so they don't dominate early
-        nn.init.normal_(self.W_mu.weight, std=0.01)
-        nn.init.normal_(self.W_gamma.weight, std=0.01)
-        nn.init.normal_(self.W_Q.weight, std=0.01)
-
-    def _get_hidden_states(
-        self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run GPT-2 and return:
-          - lm_logits: (B, T, vocab)
-          - hidden:    (B, T, d) from the second-to-last layer
-        """
-        outputs = self.gpt2(
-            input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        # outputs.hidden_states is a tuple of (n_layer+1) tensors
-        # index 0 = embedding output, index i = output of layer i-1
-        # second-to-last layer activation = index (n_layer - 1) = hook_layer + 1
-        hidden = outputs.hidden_states[self.hook_layer + 1]  # (B, T, d)
-        return outputs.logits, hidden
-
     def forward_lm(
         self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Return (mean_log_prob, hidden_last_token).
-        mean_log_prob: scalar, mean log p(x) over tokens (teacher-forced).
-        hidden_last_token: (B, d) activation at last real token from layer L-1.
+        Return mean_log_prob: scalar, mean log p(x) over tokens (teacher-forced).
         """
-        logits, hidden = self._get_hidden_states(input_ids, attention_mask)
+        outputs = self.gpt2(input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
         # Shift for causal LM: predict token t+1 from position t
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
@@ -303,90 +266,87 @@ class CurriculumGPT2(nn.Module):
         else:
             mean_lp = token_log_probs.mean()
 
-        # Last-token hidden state (for Q-head)
-        if attention_mask is not None:
-            lengths = attention_mask.sum(dim=1) - 1  # (B,)
-            h_last = hidden[torch.arange(hidden.size(0), device=hidden.device), lengths]
-        else:
-            h_last = hidden[:, -1, :]  # (B, d)
-
-        return mean_lp, h_last
-
-    def get_policy_state(self, device: torch.device) -> torch.Tensor:
-        """
-        Forward pass on just <s> token to get z = f_theta^{(L-1)}(<s>).
-        Returns z: (d,)
-        """
-        bos_id = self.tokenizer.bos_token_id
-        if bos_id is None:
-            bos_id = self.tokenizer.eos_token_id
-        input_ids = torch.tensor([[bos_id]], device=device)
-        _, hidden = self._get_hidden_states(input_ids)
-        return hidden[0, 0, :]  # (d,)
-
-    def policy_params(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Given z (d,), return mu (d_phi,) and log_sigma2 (d_phi,)."""
-        mu = self.W_mu(z)                # (d_phi,)
-        log_sigma2 = self.W_gamma(z)     # (d_phi,)
-        return mu, log_sigma2
-
-    def q_value(self, h_last: torch.Tensor) -> torch.Tensor:
-        """
-        Given last-token hidden state(s), return scalar Q value(s).
-        h_last: (d,) or (B, d) -> scalar or (B,)
-        """
-        return self.W_Q(h_last).squeeze(-1)
+        return mean_lp
 
 
 # ---------------------------------------------------------------------------
-# Policy: Gaussian in embedding space normalised over S_t
+# Policy: Boltzmann distribution over fitted soft values
 # ---------------------------------------------------------------------------
 
-def compute_log_pi(
-    mu: torch.Tensor,
-    log_sigma2: torch.Tensor,
-    E_S: torch.Tensor,
-    fix_sigma: bool = False,
-    temperature: float = 1.0,
-) -> torch.Tensor:
+class SoftValuePolicy:
     """
-    Compute log pi(x) for all x in S_t.
+    Policy pi(x) = softmax(w . phi(x) / beta) over candidates S_t.
 
-    mu:         (d_phi,)
-    log_sigma2: (d_phi,)
-    E_S:        (|S_t|, d_phi)
-    fix_sigma:  if True, use sigma^2 = 1 (ignore log_sigma2)
-    temperature: scale logits by this factor before softmax (higher = more uniform)
+    w is a value vector in embedding space (d_phi,), updated by online
+    linear regression toward observed rewards:
+        w <- w - eta * (w . phi(x_k) - r_k) * phi(x_k)
 
-    Returns log_pi: (|S_t|,)  (log-normalised over S_t)
-
-    The constant terms in the Gaussian log-density cancel in the softmax
-    normalisation, so we only need the quadratic part as logits:
-        logit(x) = -0.5 * sum_d (phi(x)_d - mu_d)^2 / sigma^2_d
+    This is the Boltzmann distribution over estimated values V(x) = w . phi(x).
+    The entropy H(pi) is implicitly controlled by beta (temperature).
     """
-    diff = E_S - mu.unsqueeze(0)  # (|S_t|, d_phi)
-    if fix_sigma:
-        logits = -0.5 * (diff ** 2).sum(dim=-1)  # (|S_t|,)
-    else:
-        sigma2 = torch.exp(log_sigma2).clamp(min=1e-8)  # (d_phi,)
-        logits = -0.5 * (diff ** 2 / sigma2.unsqueeze(0)).sum(dim=-1)  # (|S_t|,)
-    # Temperature scaling: divide logits by temperature
-    logits = logits / max(temperature, 1e-8)
-    log_pi = F.log_softmax(logits, dim=0)  # (|S_t|,)
-    return log_pi
 
+    def __init__(self, d_phi: int, beta: float, lr: float, device: torch.device):
+        self.beta = beta
+        self.lr = lr
+        self.device = device
+        # Initialize w to zero: uniform policy at start (all logits equal)
+        self.w = torch.zeros(d_phi, device=device)
+        # Running stats for logging
+        self.n_updates = 0
+        self.reward_ema = 0.0  # exponential moving average of rewards
 
-def sample_from_pi(log_pi: torch.Tensor) -> int:
-    """Sample one index from log_pi. Returns int index into S_t."""
-    probs = torch.exp(log_pi)
-    idx = torch.multinomial(probs, num_samples=1).item()
-    return idx
+    def log_pi(self, E_S: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log pi(x) for all x in S_t.
+        E_S: (|S_t|, d_phi) — candidate embeddings.
+        Returns: (|S_t|,) log-probabilities.
+        """
+        logits = E_S @ self.w / max(self.beta, 1e-8)  # (|S_t|,)
+        return F.log_softmax(logits, dim=0)
 
+    def sample(self, E_S: torch.Tensor) -> tuple[int, torch.Tensor]:
+        """
+        Sample one candidate index from pi.
+        Returns (idx, log_pi) where log_pi is the full (|S_t|,) vector.
+        """
+        lp = self.log_pi(E_S)
+        probs = torch.exp(lp)
+        idx = torch.multinomial(probs, num_samples=1).item()
+        return idx, lp
 
-def sample_M_from_pi(log_pi: torch.Tensor, M: int) -> torch.Tensor:
-    """Sample M indices (with replacement) from log_pi."""
-    probs = torch.exp(log_pi)
-    return torch.multinomial(probs, num_samples=M, replacement=True)
+    def update(self, phi_x: torch.Tensor, r_k: float):
+        """
+        Online linear regression step:
+            w <- w - eta * (w . phi(x) - r_k) * phi(x)
+
+        phi_x: (d_phi,) — embedding of selected candidate.
+        r_k: scalar reward (scaled held-out improvement).
+        """
+        predicted = self.w @ phi_x  # scalar
+        error = predicted - r_k
+        self.w = self.w - self.lr * error * phi_x
+        self.n_updates += 1
+        # EMA of reward for baseline / logging
+        alpha = min(1.0, 2.0 / (self.n_updates + 1))
+        self.reward_ema = (1 - alpha) * self.reward_ema + alpha * r_k
+
+    def stats(self, log_pi: torch.Tensor) -> dict:
+        """Compute policy diagnostics."""
+        pi = torch.exp(log_pi.detach())
+        entropy = -(pi * log_pi.detach()).sum().item()
+        max_prob = pi.max().item()
+        min_prob = pi.min().item()
+        effective_n = math.exp(entropy) if entropy > 0 else 1.0
+        return {
+            "pi_entropy": entropy,
+            "pi_max_prob": max_prob,
+            "pi_min_prob": min_prob,
+            "pi_effective_n": effective_n,
+            "w_norm": self.w.norm().item(),
+            "w_mean": self.w.mean().item(),
+            "reward_ema": self.reward_ema,
+            "value_pred": 0.0,  # filled in by caller
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -413,43 +373,7 @@ def mean_log_prob_dataset(
 ) -> float:
     """
     Compute (1/|D|) sum_x log p_theta(x) over a set of context windows.
-    Uses batched forward passes for GPU efficiency.
     batch_size=0 means process all at once.
-
-    token_ids: list[list[int]] OR pre-built (N, T) tensor on *device*.
-    """
-    if isinstance(token_ids, torch.Tensor):
-        all_ids = token_ids  # already (N, T) on device
-    else:
-        all_ids = _tokens_to_tensor(token_ids, device)
-    N = all_ids.size(0)
-    bs = N if batch_size <= 0 else batch_size
-    total_lp = 0.0
-    for start in range(0, N, bs):
-        chunk = all_ids[start : start + bs]           # (B, T)
-        lp, _ = model.forward_lm(chunk)
-        # forward_lm returns a single scalar mean over all tokens in the batch,
-        # so we weight by the number of examples in this chunk.
-        total_lp += lp.item() * chunk.size(0)
-    return total_lp / N
-
-
-# ---------------------------------------------------------------------------
-# Utility: compute Q-values for a batch of context windows (batched)
-# ---------------------------------------------------------------------------
-
-def compute_q_values(
-    model: CurriculumGPT2,
-    token_ids,
-    device: torch.device,
-    batch_size: int = 0,
-) -> torch.Tensor:
-    """
-    Compute Q_theta(x) for each x in the batch.
-    Returns (N,) tensor of Q-values (with grad through W_Q and backbone).
-    Uses batched forward passes for GPU efficiency.
-
-    token_ids: list[list[int]] OR pre-built (N, T) tensor on *device*.
     """
     if isinstance(token_ids, torch.Tensor):
         all_ids = token_ids
@@ -457,13 +381,12 @@ def compute_q_values(
         all_ids = _tokens_to_tensor(token_ids, device)
     N = all_ids.size(0)
     bs = N if batch_size <= 0 else batch_size
-    q_chunks = []
+    total_lp = 0.0
     for start in range(0, N, bs):
-        chunk = all_ids[start : start + bs]             # (B, T)
-        _, h_last = model.forward_lm(chunk)              # (B, d)
-        q = model.q_value(h_last)                        # (B,)
-        q_chunks.append(q)
-    return torch.cat(q_chunks)
+        chunk = all_ids[start : start + bs]
+        lp = model.forward_lm(chunk)
+        total_lp += lp.item() * chunk.size(0)
+    return total_lp / N
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +410,7 @@ def select_loss_based(
     with torch.no_grad():
         for i, ids in enumerate(S_t_tokens):
             input_ids = torch.tensor([ids], device=device)
-            lp, _ = model.forward_lm(input_ids)
+            lp = model.forward_lm(input_ids)
             if lp.item() < worst_lp:
                 worst_lp = lp.item()
                 worst_idx = i
@@ -506,7 +429,8 @@ def select_uncertainty_based(
     with torch.no_grad():
         for i, ids in enumerate(S_t_tokens):
             input_ids = torch.tensor([ids], device=device)
-            logits, _ = model._get_hidden_states(input_ids)
+            outputs = model.gpt2(input_ids)
+            logits = outputs.logits
             probs = F.softmax(logits[:, :-1, :], dim=-1)
             ent = -(probs * probs.clamp(min=1e-12).log()).sum(-1).mean().item()
             if ent > best_ent:
@@ -516,67 +440,16 @@ def select_uncertainty_based(
 
 
 # ---------------------------------------------------------------------------
-# Diagnostics: gradient norms, weight norms, policy stats
+# Diagnostics
 # ---------------------------------------------------------------------------
 
-def _grad_norm(model: CurriculumGPT2) -> dict:
-    """Compute per-component gradient norms (after backward, before step)."""
-    backbone_grads, mu_grads, gamma_grads, q_grads = [], [], [], []
-    for name, p in model.named_parameters():
-        if p.grad is None:
-            continue
-        g = p.grad.detach().norm().item()
-        if name.startswith("W_mu"):
-            mu_grads.append(g)
-        elif name.startswith("W_gamma"):
-            gamma_grads.append(g)
-        elif name.startswith("W_Q"):
-            q_grads.append(g)
-        else:
-            backbone_grads.append(g)
-    def _rms(xs):
-        return math.sqrt(sum(x**2 for x in xs) / max(len(xs), 1)) if xs else 0.0
-    return {
-        "grad_norm_backbone": _rms(backbone_grads),
-        "grad_norm_W_mu": _rms(mu_grads),
-        "grad_norm_W_gamma": _rms(gamma_grads),
-        "grad_norm_W_Q": _rms(q_grads),
-    }
-
-
-def _weight_norms(model: CurriculumGPT2) -> dict:
-    """Compute weight norms for the projection heads."""
-    return {
-        "wnorm_W_mu": model.W_mu.weight.detach().norm().item(),
-        "wnorm_W_gamma": model.W_gamma.weight.detach().norm().item(),
-        "wnorm_W_Q": model.W_Q.weight.detach().norm().item(),
-    }
-
-
-def _policy_stats(log_pi: torch.Tensor, log_sigma2: torch.Tensor, fix_sigma: bool = False) -> dict:
-    """Compute policy distribution diagnostics."""
-    pi = torch.exp(log_pi.detach())
-    entropy = -(pi * log_pi.detach()).sum().item()
-    max_prob = pi.max().item()
-    min_prob = pi.min().item()
-    effective_n = math.exp(entropy) if entropy > 0 else 1.0
-    stats = {
-        "pi_entropy": entropy,
-        "pi_max_prob": max_prob,
-        "pi_min_prob": min_prob,
-        "pi_effective_n": effective_n,
-    }
-    # Only log sigma2 stats when sigma is learned (not fixed)
-    if not fix_sigma:
-        sigma2 = torch.exp(log_sigma2.detach())
-        stats.update({
-            "sigma2_mean": sigma2.mean().item(),
-            "sigma2_std": sigma2.std().item(),
-            "sigma2_min": sigma2.min().item(),
-            "sigma2_max": sigma2.max().item(),
-            "log_sigma2_mean": log_sigma2.detach().mean().item(),
-        })
-    return stats
+def _grad_norm_lm(model: CurriculumGPT2) -> float:
+    """Compute total gradient norm of the LM model."""
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.detach().norm().item() ** 2
+    return math.sqrt(total)
 
 
 def _gpu_stats() -> dict:
@@ -594,36 +467,6 @@ def _sync():
     """Synchronize CUDA for accurate timing."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-
-
-# ---------------------------------------------------------------------------
-# Reward normalization
-# ---------------------------------------------------------------------------
-
-class RewardNormalizer:
-    """Welford online estimator of reward std for normalization."""
-
-    def __init__(self):
-        self.n = 0
-        self.mean = 0.0
-        self.M2 = 0.0
-
-    def update(self, r: float):
-        self.n += 1
-        delta = r - self.mean
-        self.mean += delta / self.n
-        delta2 = r - self.mean
-        self.M2 += delta * delta2
-
-    @property
-    def std(self) -> float:
-        if self.n < 2:
-            return 1.0
-        return math.sqrt(self.M2 / (self.n - 1)) or 1.0
-
-    def normalize(self, r: float) -> float:
-        """Return r / running_std (mean is NOT subtracted — we want sign preserved)."""
-        return r / self.std
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +501,7 @@ def train(cfg: Config):
     logging.info("Device: %s", device)
     logging.info("Curriculum mode: %s", cfg.curriculum)
 
-    # --- Tokenizer (needed before model for embedder) ---
+    # --- Tokenizer ---
     tokenizer = GPT2Tokenizer.from_pretrained(cfg.model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -666,54 +509,49 @@ def train(cfg: Config):
     embedder = make_embedder(cfg, tokenizer)
     logging.info("Embedding dimension (d_phi): %d", cfg.d_phi)
 
-    # --- Model (needs d_phi set) ---
+    # --- Model (pure LM, no RL heads) ---
     model = CurriculumGPT2(cfg).to(device)
-
-    # Single optimizer for all parameters (shared lr)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    # --- Soft-value policy (separate from model) ---
+    policy = SoftValuePolicy(
+        d_phi=cfg.d_phi, beta=cfg.beta, lr=cfg.value_lr, device=device,
+    )
+    logging.info(
+        "Soft-value policy: beta=%.3f, value_lr=%.4f, d_phi=%d",
+        cfg.beta, cfg.value_lr, cfg.d_phi,
+    )
 
     # --- Data ---
     stream = DataStream(cfg, tokenizer)
 
-    # --- Fixed eval set (drawn once, used throughout) ---
+    # --- Fixed eval set ---
     logging.info("Drawing %d fixed eval windows ...", cfg.num_eval_windows)
     eval_tokens_list = stream.get_batch(cfg.num_eval_windows)
-    eval_ids = _tokens_to_tensor(eval_tokens_list, device)  # (num_eval, T) on GPU
+    eval_ids = _tokens_to_tensor(eval_tokens_list, device)
     init_ppl = evaluate_perplexity(model, eval_ids, device, batch_size=cfg.batch_size)
     logging.info("Initial eval perplexity: %.2f", init_ppl)
     if device.type == "cuda":
-        torch.cuda.empty_cache()  # free fragmented memory from init eval
+        torch.cuda.empty_cache()
 
     # --- Logging ---
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     log_path = Path(cfg.checkpoint_dir) / "log.jsonl"
-    # Clear log from previous runs so plots don't overlay stale data
     if log_path.exists():
         log_path.unlink()
         logging.info("Cleared old log file: %s", log_path)
-    # Generate a unique run ID
     run_id = time.strftime("%Y%m%d_%H%M%S")
     logging.info("Run ID: %s", run_id)
-    # Write config
     with open(Path(cfg.checkpoint_dir) / "config.json", "w") as f:
         cfg_dict = cfg.__dict__.copy()
         cfg_dict["run_id"] = run_id
+        cfg_dict["formulation"] = "free_energy_softvalue"
         json.dump(cfg_dict, f, indent=2)
 
     logging.info(
         "Starting training: %d outer steps x %d inner steps  (curriculum=%s)",
         cfg.outer_steps, cfg.inner_steps, cfg.curriculum,
     )
-
-    # Policy temperature: auto = scale by d_phi so logits are O(1)
-    if cfg.policy_temp > 0:
-        policy_temp = cfg.policy_temp
-    else:
-        policy_temp = float(cfg.d_phi)  # auto: divide by d_phi
-    logging.info("Policy temperature: %.1f  (d_phi=%d)", policy_temp, cfg.d_phi)
-
-    # Reward scaling
-    logging.info("Reward scale: %.1f  (raw r_k * scale -> RL reward)", cfg.reward_scale)
 
     total_examples_seen = 0
     cumulative_reward = 0.0
@@ -725,10 +563,10 @@ def train(cfg: Config):
         # === Outer loop: refresh S_t, D_t ===
         t_data = time.time()
         S_t_tokens, D_t_tokens = stream.get_stream_step()
-        D_t_ids = _tokens_to_tensor(D_t_tokens, device)  # (|D_t|, T) on GPU
+        D_t_ids = _tokens_to_tensor(D_t_tokens, device)
         dt_data = time.time() - t_data
 
-        # Pre-compute embeddings for S_t  (only needed for RL mode)
+        # Pre-compute embeddings for S_t (needed for rl mode)
         E_S = None
         dt_embed = 0.0
         if cfg.curriculum == "rl":
@@ -736,7 +574,7 @@ def train(cfg: Config):
             E_S = embedder.embed_batch(S_t_tokens).to(device)  # (|S_t|, d_phi)
             dt_embed = time.time() - t_emb
 
-        # Cache held-out log-prob before inner loop (for reward computation)
+        # Cache held-out log-prob before inner loop
         t_held = time.time()
         prev_heldout_lp = mean_log_prob_dataset(model, D_t_ids, device, batch_size=cfg.batch_size)
         dt_heldout_init = time.time() - t_held
@@ -746,14 +584,12 @@ def train(cfg: Config):
             timings = {}
 
             # ==============================================================
-            # Step 1: Select a training example
+            # Step 1 (E-step): Select a training example from pi
             # ==============================================================
             _sync(); t0 = time.time()
+            log_pi_k = None
             if cfg.curriculum == "rl":
-                idx_k, log_pi_k, z_k, mu_k, log_sigma2_k = _rl_select(
-                    model, E_S, device, fix_sigma=cfg.fix_sigma,
-                    temperature=policy_temp,
-                )
+                idx_k, log_pi_k = policy.sample(E_S)
             elif cfg.curriculum == "random":
                 idx_k = select_random(S_t_tokens)
             elif cfg.curriculum == "loss":
@@ -769,53 +605,24 @@ def train(cfg: Config):
             total_examples_seen += 1
 
             # ==============================================================
-            # Step 6 (pre-computed): Baseline V_k under theta_k
-            #   Must be computed here, before the LM step changes theta.
-            #   We sample M candidates from pi_{theta_k} and average Q_{theta_k}.
-            # ==============================================================
-            V_k_val = None
-            if cfg.curriculum == "rl":
-                _sync(); t0 = time.time()
-                sample_indices_k = sample_M_from_pi(log_pi_k.detach(), cfg.M)
-                sampled_tokens_k = [S_t_tokens[i] for i in sample_indices_k]
-                with torch.no_grad():
-                    q_samples_k = compute_q_values(model, sampled_tokens_k, device, batch_size=cfg.M)
-                    V_k_val = q_samples_k.mean().item()
-                _sync(); timings["t_V_k"] = round(time.time() - t0, 4)
-
-            # ==============================================================
-            # Step 2: Language-modeling update (MDP state transition)
-            #   theta_{k+1} = theta_k + alpha * grad log p(x_k)
+            # Step 2 (M-step): Language-modeling update
+            #   theta <- theta + alpha * grad log p(x_k)
             # ==============================================================
             _sync(); t0 = time.time()
-
-            # Snapshot theta_k so we can evaluate log pi_{theta_k} exactly
-            # in the RL update (Step 7) after the LM step mutates params.
-            theta_k_snapshot = None
-            if cfg.curriculum == "rl":
-                theta_k_snapshot = {
-                    n: p.data.clone() for n, p in model.named_parameters()
-                }
-
             input_ids_xk = torch.tensor([x_k_tokens], device=device)
-            lm_logp, _ = model.forward_lm(input_ids_xk)
-            lm_loss = -lm_logp  # minimise negative log-prob
+            lm_logp = model.forward_lm(input_ids_xk)
+            lm_loss = -lm_logp
 
             optimizer.zero_grad()
             lm_loss.backward()
-            lm_grad_stats = _grad_norm(model)
-            lm_grad_total = math.sqrt(sum(
-                p.grad.detach().norm().item()**2
-                for p in model.parameters() if p.grad is not None
-            ))
+            lm_grad_total = _grad_norm_lm(model)
             if cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
             _sync(); timings["t_lm_update"] = round(time.time() - t0, 4)
-            # model now holds theta_{k+1}
 
             # ==============================================================
-            # Step 3: Reward  r_k = mean_lp(D, theta_{k+1}) - mean_lp(D, theta_k)
+            # Step 3: Reward  r_k = mean_lp(D, theta') - mean_lp(D, theta)
             # ==============================================================
             _sync(); t0 = time.time()
             new_heldout_lp = mean_log_prob_dataset(model, D_t_ids, device, batch_size=cfg.batch_size)
@@ -825,31 +632,25 @@ def train(cfg: Config):
             _sync(); timings["t_reward"] = round(time.time() - t0, 4)
 
             # ==============================================================
-            # Steps 4-7: RL loss (only in RL curriculum mode)
-            # Skip inner_step=0: the first reward after a dataset refresh
-            # has no prior baseline on this D_t, so it's noisier.
+            # Step 4: Value regression update on w
+            #   w <- w - eta * (w . phi(x_k) - r_k) * phi(x_k)
             # ==============================================================
-            rl_stats = {}
-            if cfg.curriculum == "rl" and k > 0:
+            value_stats = {}
+            if cfg.curriculum == "rl":
                 _sync(); t0 = time.time()
-                rl_stats = _rl_update(
-                    model=model,
-                    optimizer=optimizer,
-                    cfg=cfg,
-                    device=device,
-                    S_t_tokens=S_t_tokens,
-                    E_S=E_S,
-                    x_k_tokens=x_k_tokens,
-                    idx_k=idx_k,
-                    r_k=r_k,
-                    V_k=V_k_val,
-                    theta_k_snapshot=theta_k_snapshot,
-                    fix_sigma=cfg.fix_sigma,
-                    temperature=policy_temp,
-                )
-                _sync(); timings["t_rl_total"] = round(time.time() - t0, 4)
+                phi_xk = E_S[idx_k]  # (d_phi,)
+                value_pred = (policy.w @ phi_xk).item()
+                policy.update(phi_xk, r_k)
+                _sync(); timings["t_value_update"] = round(time.time() - t0, 4)
 
-            # Update cached held-out log-prob for next step
+                # Policy diagnostics (recompute log_pi after w update)
+                log_pi_after = policy.log_pi(E_S)
+                pol_stats = policy.stats(log_pi_after)
+                pol_stats["value_pred"] = value_pred
+                pol_stats["value_error"] = value_pred - r_k
+                value_stats = pol_stats
+
+            # Update cached held-out log-prob
             prev_heldout_lp = new_heldout_lp
 
             # --- Logging ---
@@ -875,24 +676,21 @@ def train(cfg: Config):
                     "cumulative_reward": cumulative_reward,
                     "heldout_lp": new_heldout_lp,
                     "lm_loss": lm_loss.item(),
-                    # -- LM gradient norms --
+                    # -- LM gradient norm --
                     "lm_grad_total": lm_grad_total,
-                    **{f"lm_{k2}": v for k2, v in lm_grad_stats.items()},
-                    # -- Weight norms --
-                    **_weight_norms(model),
                     # -- GPU --
                     **_gpu_stats(),
-                    # -- RL-specific --
-                    **rl_stats,
+                    # -- Soft-value policy stats --
+                    **value_stats,
                 }
                 logging.info(
-                    "[t=%d k=%d] r=%.5f heldout=%.4f lm=%.4f grad=%.3f (%.2fs: sel=%.3f lm=%.3f rew=%.3f rl=%.3f)%s",
+                    "[t=%d k=%d] r=%.4f heldout=%.4f lm=%.4f grad=%.3f (%.2fs)"
+                    "  w_norm=%.3f ent=%.2f eff_n=%.0f",
                     t, k, r_k, new_heldout_lp, lm_loss.item(),
                     lm_grad_total, step_time,
-                    timings.get("t_select", 0), timings.get("t_lm_update", 0),
-                    timings.get("t_reward", 0), timings.get("t_rl_total", 0),
-                    f"  Q={rl_stats.get('q_xk', 0):.4f} A={rl_stats.get('A_k', 0):.4f}"
-                    if rl_stats else "",
+                    value_stats.get("w_norm", 0),
+                    value_stats.get("pi_entropy", 0),
+                    value_stats.get("pi_effective_n", 0),
                 )
                 with open(log_path, "a") as f:
                     f.write(json.dumps(log_entry) + "\n")
@@ -907,7 +705,8 @@ def train(cfg: Config):
             dt_eval = time.time() - t0
             wall_clock = time.time() - train_start_time
             logging.info(
-                "[Outer %d] ppl=%.2f eval_lp=%.4f (ex=%d, %.0fs) outer=%.1fs (data=%.2f emb=%.2f held=%.2f eval=%.2f)",
+                "[Outer %d] ppl=%.2f eval_lp=%.4f (ex=%d, %.0fs) outer=%.1fs"
+                " (data=%.2f emb=%.2f held=%.2f eval=%.2f)",
                 t, ppl, eval_lp, total_examples_seen, wall_clock,
                 outer_time, dt_data, dt_embed, dt_heldout_init, dt_eval,
             )
@@ -924,7 +723,7 @@ def train(cfg: Config):
                 "t_embed": round(dt_embed, 4),
                 "t_heldout_init": round(dt_heldout_init, 4),
                 "t_eval": round(dt_eval, 4),
-                **_weight_norms(model),
+                "w_norm": policy.w.norm().item() if cfg.curriculum == "rl" else 0.0,
                 **_gpu_stats(),
             }
             with open(log_path, "a") as f:
@@ -932,191 +731,15 @@ def train(cfg: Config):
 
         if cfg.save_every_outer > 0 and (t + 1) % cfg.save_every_outer == 0:
             ckpt_path = Path(cfg.checkpoint_dir) / f"model_outer_{t:04d}.pt"
-            torch.save(model.state_dict(), ckpt_path)
+            save_dict = {
+                "model_state_dict": model.state_dict(),
+                "w": policy.w.cpu(),
+                "beta": policy.beta,
+            }
+            torch.save(save_dict, ckpt_path)
             logging.info("[Outer %d] Checkpoint saved to %s", t, ckpt_path)
 
     logging.info("Training complete.  Total examples seen: %d", total_examples_seen)
-
-
-# ---------------------------------------------------------------------------
-# RL-specific helpers (kept separate for clarity)
-# ---------------------------------------------------------------------------
-
-def _rl_select(
-    model: CurriculumGPT2,
-    E_S: torch.Tensor,
-    device: torch.device,
-    fix_sigma: bool = False,
-    temperature: float = 1.0,
-) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Step 1 of the algorithm: compute policy and sample an example.
-    Returns (idx_k, log_pi_k, z_k, mu_k, log_sigma2_k).
-    """
-    z_k = model.get_policy_state(device)              # (d,)
-    mu_k, log_sigma2_k = model.policy_params(z_k)     # (d_phi,) each
-    log_pi_k = compute_log_pi(mu_k, log_sigma2_k, E_S, fix_sigma=fix_sigma,
-                              temperature=temperature)
-    idx_k = sample_from_pi(log_pi_k)
-    return idx_k, log_pi_k, z_k, mu_k, log_sigma2_k
-
-
-def _rl_update(
-    *,
-    model: CurriculumGPT2,
-    optimizer: torch.optim.Optimizer,
-    cfg: Config,
-    device: torch.device,
-    S_t_tokens: list[list[int]],
-    E_S: torch.Tensor,
-    x_k_tokens: list[int],
-    idx_k: int,
-    r_k: float,
-    V_k: float,
-    theta_k_snapshot: dict[str, torch.Tensor],
-    fix_sigma: bool = False,
-    temperature: float = 1.0,
-) -> dict:
-    """
-    Steps 4, 5, 7 of the algorithm (Step 6 / V_k is pre-computed).
-
-    At entry, model holds theta_{k+1} (after the LM step).
-    At exit, model holds theta_{k+1} with the RL gradient applied on top
-    (i.e. the combined update from both the LM transition and RL loss).
-
-    V_k (the baseline value) is computed in the main loop *before* the LM
-    step, while the model is still at theta_k.  This ensures V_k reflects
-    the state in which the action was selected, as the paper specifies.
-
-    theta_k_snapshot is a dict {name: tensor} of parameter values at theta_k,
-    snapshotted before the LM step.  We temporarily load these into the model
-    to compute the exact policy gradient nabla_{theta_k} log pi_{theta_k}(x_k).
-
-    The paper specifies:
-      - Q_{theta_k}(x_k) = W_Q * u_k  where u_k = f_{theta_{k+1}}^{(L-1)}(x_k^last)
-        (eq 6: Q uses W_Q but u_k comes from theta_{k+1} forward pass)
-      - The Bellman loss LHS is Q_{theta_k}(x_k), target is r_k + gamma * sg(V_{k+1})
-      - The policy loss uses advantage A_k = sg(Q_{theta_k}(x_k) - V_k)
-      - Gradients of L_Q flow through W_Q and the backbone at theta_{k+1}
-      - Gradients of L_pi flow through W_mu, W_gamma, and the backbone at theta_k
-    """
-    # ---- Step 4: Q-value of selected example under theta_{k+1} ----
-    _sync(); t0 = time.time()
-    input_ids_xk = torch.tensor([x_k_tokens], device=device)
-    _, h_last_k = model.forward_lm(input_ids_xk)  # u_k under theta_{k+1}
-    q_xk = model.q_value(h_last_k.squeeze(0))      # scalar, has grad
-    _sync(); dt_q_xk = time.time() - t0
-
-    # ---- Step 5: Next-state value V_{k+1} ----
-    _sync(); t0 = time.time()
-    z_kp1 = model.get_policy_state(device)
-    mu_kp1, log_sigma2_kp1 = model.policy_params(z_kp1)
-    log_pi_kp1 = compute_log_pi(mu_kp1, log_sigma2_kp1, E_S, fix_sigma=fix_sigma,
-                                temperature=temperature)
-
-    sample_indices_kp1 = sample_M_from_pi(log_pi_kp1.detach(), cfg.M)
-    sampled_tokens_kp1 = [S_t_tokens[i] for i in sample_indices_kp1]
-    with torch.no_grad():
-        q_samples_kp1 = compute_q_values(model, sampled_tokens_kp1, device, batch_size=cfg.M)
-        V_kp1 = q_samples_kp1.mean()
-    _sync(); dt_V_kp1 = time.time() - t0
-
-    # ---- Step 6: Baseline value V_k (pre-computed under theta_k) ----
-    # V_k was computed in the main loop before the LM step, passed in as a float.
-
-    # ---- Step 7: Combined loss ----
-    # We compute L_Q and L_pi in two phases because they use different parameter
-    # values: L_Q uses theta_{k+1} (current), L_pi uses theta_k (snapshot).
-
-    # -- Phase A: L_Q at theta_{k+1} --
-    _sync(); t0 = time.time()
-    # Bellman target (stop-gradient)
-    y_k = r_k + cfg.gamma * V_kp1.item()
-    L_Q = (q_xk - y_k) ** 2
-
-    # Advantage (stop-gradient); needed for L_pi magnitude
-    A_k = q_xk.detach().item() - V_k
-
-    # Compute and stash L_Q gradients at theta_{k+1}
-    optimizer.zero_grad()
-    L_Q.backward()
-    q_grad_snapshot = {
-        n: p.grad.clone() if p.grad is not None else torch.zeros_like(p)
-        for n, p in model.named_parameters()
-    }
-
-    # -- Phase B: L_pi at theta_k (exact) --
-    # Temporarily load theta_k into the model so that the forward pass and
-    # autograd produce nabla_{theta_k} log pi_{theta_k}(x_k).
-    theta_kp1_snapshot = {
-        n: p.data.clone() for n, p in model.named_parameters()
-    }
-    for n, p in model.named_parameters():
-        p.data.copy_(theta_k_snapshot[n])
-
-    # Forward pass at theta_k to build a live computation graph
-    z_k_pg = model.get_policy_state(device)
-    mu_k_pg, log_sigma2_k_pg = model.policy_params(z_k_pg)
-    log_pi_k_pg = compute_log_pi(mu_k_pg, log_sigma2_k_pg, E_S, fix_sigma=fix_sigma,
-                                temperature=temperature)
-
-    L_pi = -A_k * log_pi_k_pg[idx_k]
-
-    optimizer.zero_grad()
-    L_pi.backward()  # gradients are now nabla_{theta_k} L_pi
-
-    # -- Combine: add L_Q grads (from theta_{k+1}) to L_pi grads (from theta_k) --
-    for n, p in model.named_parameters():
-        if p.grad is not None:
-            p.grad.add_(q_grad_snapshot[n])
-        else:
-            p.grad = q_grad_snapshot[n].clone()
-
-    rl_grad_stats = _grad_norm(model)
-    rl_grad_total = math.sqrt(sum(
-        p.grad.detach().norm().item()**2
-        for p in model.parameters() if p.grad is not None
-    ))
-
-    # Restore theta_{k+1} before applying the RL gradient step.
-    # The optimizer step will update from theta_{k+1} using the combined gradient.
-    for n, p in model.named_parameters():
-        p.data.copy_(theta_kp1_snapshot[n])
-
-    if cfg.grad_clip > 0:
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-    optimizer.step()
-    _sync(); dt_pg_step = time.time() - t0
-
-    # Policy distribution diagnostics (from the theta_k policy, which is what
-    # the algorithm actually uses for selection)
-    pol_stats = _policy_stats(log_pi_k_pg, log_sigma2_k_pg, fix_sigma=fix_sigma)
-
-    # Bellman TD error
-    td_error = q_xk.item() - y_k
-
-    return {
-        # -- Q / value / advantage --
-        "q_xk": q_xk.item(),
-        "V_k": V_k,
-        "V_kp1": V_kp1.item(),
-        "A_k": A_k,
-        "td_error": td_error,
-        "bellman_target": y_k,
-        # -- Losses --
-        "L_Q": L_Q.item(),
-        "L_pi": L_pi.item(),
-        "L_k": L_Q.item() + L_pi.item(),
-        # -- RL gradient norms --
-        "rl_grad_total": rl_grad_total,
-        **{f"rl_{k2}": v for k2, v in rl_grad_stats.items()},
-        # -- Policy distribution --
-        **pol_stats,
-        # -- RL sub-timings --
-        "t_q_xk": round(dt_q_xk, 4),
-        "t_V_kp1": round(dt_V_kp1, 4),
-        "t_pg_step": round(dt_pg_step, 4),
-    }
 
 
 # ---------------------------------------------------------------------------
