@@ -137,6 +137,87 @@ Let $L$ be the number of transformer layers.  All activations used by the policy
 
 The state-value baseline $V$ is estimated by sampling $M$ candidates from $\pi$ and averaging their $Q$ values, yielding the advantage $A = Q_\theta(x) - V$.
 
+\subsection{Alternative: Unified Meta-Learning Objective}\label{sec:unified}
+
+The algorithm in Section~2.3 treats the language-modeling update as an opaque MDP transition and uses a learned Q-function to estimate the value of selecting each training example.  An alternative is to \emph{differentiate through} the LM update itself, yielding a single objective that subsumes both the data-selection policy and the training step.
+
+\subsubsection{Myopic formulation ($\gamma = 0$)}
+
+Define the one-step \emph{meta-objective}:
+\begin{equation}\label{eq:meta-obj}
+    J(\theta) \;=\; \mathbb{E}_{x \sim \pi_\theta}\!\Bigl[\,
+        \tfrac{1}{|D_t|}\,\log p_{\,\theta'}(D_t)
+    \,\Bigr],
+    \qquad
+    \theta' \;=\; \theta + \alpha\,\nabla_\theta \log p_\theta(x).
+\end{equation}
+This says: select $x$ to maximise the held-out log-probability of the model obtained after one gradient step on~$x$.  Because $\theta'$ is a differentiable function of~$\theta$ (and of the choice of~$x$), we can compute $\nabla_\theta J$ by back-propagating through the inner gradient step.
+
+The gradient decomposes into two terms.  Because $x$ is drawn from a discrete distribution over $S_t$, we cannot reparameterise through the sampling; the score-function (REINFORCE) estimator gives:
+\begin{equation}\label{eq:meta-grad}
+    \nabla_\theta J
+    \;=\;
+    \mathbb{E}_{x \sim \pi_\theta}\!\Bigl[\,
+        \underbrace{%
+            \nabla_\theta\!\Bigl(\tfrac{1}{|D_t|}\log p_{\theta'}(D_t)\Bigr)\Bigr|_{\text{through }\theta'}
+        }_{\text{pathwise (chain-rule) term}}
+        \;+\;
+        \underbrace{%
+            \Bigl(\tfrac{1}{|D_t|}\log p_{\theta'}(D_t) - b\Bigr)\,
+            \nabla_\theta \log \pi_\theta(x)
+        }_{\text{score-function (REINFORCE) term}}
+    \,\Bigr],
+\end{equation}
+where $b$ is any baseline that does not depend on~$x$ (e.g.\ a running mean of the held-out log-prob).  The pathwise term differentiates the held-out evaluation through the transition $\theta' = \theta + \alpha\,\nabla_\theta \log p_\theta(x)$, requiring a Hessian-vector product $\nabla^2_\theta \log p_\theta(x)$.
+
+\paragraph{Relation to the current algorithm.}
+Setting $\gamma = 0$ in the actor-critic formulation of Section~2.3 recovers the REINFORCE term of~\eqref{eq:meta-grad} (with $Q$ playing the role of the held-out improvement and $V$ as the baseline), but \emph{discards} the pathwise term.  The unified formulation therefore strictly dominates the $\gamma = 0$ actor-critic: it uses the same REINFORCE signal plus an additional low-variance gradient that flows through the LM transition.
+
+\paragraph{What the unified formulation eliminates.}
+Under~\eqref{eq:meta-obj} the Q-function, value baseline, Bellman loss, and the $\theta_k$-snapshot machinery are all unnecessary.  The entire RL apparatus (steps~4--7) is replaced by a single backward pass through the meta-objective.  This substantially simplifies the algorithm and removes the need for the two-phase gradient computation described in the implementation note of Section~2.3.
+
+\subsubsection{Multi-step extension ($\gamma > 0$)}
+
+The myopic objective~\eqref{eq:meta-obj} optimises only the immediate one-step improvement.  To recover multi-step lookahead, one can unroll $K$ inner steps and optimise the cumulative discounted held-out improvement:
+\begin{equation}\label{eq:meta-multistep}
+    J_K(\theta_0) \;=\; \mathbb{E}\!\Biggl[\,\sum_{k=0}^{K-1} \gamma^k\,
+        \tfrac{1}{|D_t|}\,\log p_{\theta_{k+1}}(D_t)
+    \,\Biggr],
+    \qquad
+    \theta_{k+1} = \theta_k + \alpha\,\nabla_{\theta_k} \log p_{\theta_k}(x_k),
+    \quad
+    x_k \sim \pi_{\theta_k}.
+\end{equation}
+Differentiating through the full unrolling is the MAML-style approach (Finn et al., 2017).  This is exact but requires $O(K)$ memory for the intermediate parameter snapshots and $O(K)$ Hessian-vector products during the backward pass.
+
+A practical middle ground is the \textbf{hybrid} approach: use the differentiable one-step objective for the immediate reward (capturing the pathwise gradient through the LM transition), and retain the Q-function only for estimating the discounted future return beyond one step:
+\begin{equation}\label{eq:hybrid}
+    L_{\text{hybrid}} \;=\;
+    -\,\tfrac{1}{|D_t|}\,\log p_{\theta'}(D_t)
+    \;-\; \operatorname{sg}(A_k)\,\log \pi_\theta(x_k),
+\end{equation}
+where $\theta' = \theta + \alpha\,\nabla_\theta \log p_\theta(x_k)$ and $A_k$ is the multi-step advantage from the Q-function.  The first term provides the exact one-step pathwise gradient; the second provides the REINFORCE correction for long-horizon effects.
+
+\subsubsection{Tradeoffs}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Formulation} & \textbf{Q / V needed?} & \textbf{Second-order?} & \textbf{Multi-step?} \\
+\midrule
+Actor-critic (current, \S2.3) & Yes & No & Yes (via $\gamma$, $Q$) \\
+Unified myopic~\eqref{eq:meta-obj} & No & Yes (Hessian-vec) & No \\
+Hybrid~\eqref{eq:hybrid} & Yes (future only) & Yes & Yes \\
+Full unrolling~\eqref{eq:meta-multistep} & No & Yes ($K\times$) & Yes (exact) \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of objective formulations.  ``Second-order'' refers to the need for Hessian-vector products from differentiating through the LM gradient step.  For GPT-2 small, one Hessian-vector product costs roughly $2\times$ a standard backward pass; PyTorch supports this via \texttt{create\_graph=True}.}
+\label{tab:formulations}
+\end{table}
+
+The unified myopic formulation is the simplest and eliminates all auxiliary RL machinery.  Its cost is one Hessian-vector product per inner step (${\sim}2\times$ backward) and the loss of multi-step lookahead.  Whether the pathwise gradient or the multi-step Q-estimate contributes more to learning quality is an empirical question; the current implementation uses the actor-critic formulation, with the unified objective as a planned future experiment.
+
 \section{Evaluation}
 
 \subsection{Primary Metric: Sample Efficiency}
