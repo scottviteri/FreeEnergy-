@@ -2,4 +2,5 @@
 *.log
 *.out
 *.aux
-
+checkpoints/
+plots/

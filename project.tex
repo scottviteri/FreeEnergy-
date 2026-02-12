@@ -30,7 +30,10 @@ We propose an algorithm that enables language models to learn what data to learn
     \item Learned state-dependent log-variance $\log \sigma^2 = W_\gamma z$
     \item Discount factor $\gamma$; shared learning rate $\alpha$
     \item Scalar Q-function $Q_\theta(x) = W_Q\, u_x \in \mathbb{R}$, a linear projection of the last-token activation of $x$
+    \item Gradient clipping threshold $G$ (max global norm; all gradient steps are clipped to $\|\nabla\| \le G$)
 \end{itemize}
+
+\noindent\textbf{Simplification.}  In practice we optionally fix $\sigma^2 = 1$ (ignoring $W_\gamma$), reducing the policy to a learned mean in embedding space with unit-variance Gaussian weighting.  This stabilises early training when the learned variance can be poorly calibrated.
 
 \subsection{Data Streaming}\label{sec:streaming}
 
@@ -46,7 +49,7 @@ Each element of $S_t$ or $D_t$ is conceptually one full transformer context wind
 
 \subsection{Algorithm}
 
-At each outer-loop stream step $t$, we refresh $S_t, D_t$ from newly arrived data.  Candidates are sampled with replacement, so $|S_t|$ stays fixed throughout the inner loop.  We then run $K$ inner-loop steps (one per data point in Section~\ref{sec:streaming}) on fixed $S_t, D_t$ to update $\theta$.
+At each outer-loop stream step $t$, we refresh $S_t, D_t$ from newly arrived data and hold them fixed for the duration of the inner loop.  We then run $K$ inner-loop steps on fixed $S_t, D_t$ to update $\theta$.
 
 \begin{enumerate}[nosep]
     \item \textbf{Select a training example.}
