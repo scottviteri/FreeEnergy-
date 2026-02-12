@@ -23,24 +23,22 @@ We propose an algorithm that enables language models to learn what data to learn
 \subsection{Setup}
 
 \begin{itemize}[nosep]
-    \item Transformer with parameters $\theta$ and $L$ layers; write $f_\theta^{(\ell)}(x)$ for the residual-stream activation at layer $\ell$ and position of token $x$
-    \item Off-the-shelf embedding model $\phi \colon \text{text} \to \mathbb{R}^{d_\phi}$ for encoding streaming data
+    \item Language model (GPT-2) with parameters $\theta$
+    \item Off-the-shelf embedding model $\phi \colon \text{text} \to \mathbb{R}^{d_\phi}$ for encoding streaming data (e.g.\ sentence-transformers)
     \item Streaming data source, partitioned into training candidates and held-out evaluation
-    \item Policy projections $W_\mu, W_\gamma \in \mathbb{R}^{d_\phi \times d}$ (output dimension matches $\phi$)
-    \item Learned state-dependent log-variance $\log \sigma^2 = W_\gamma z$
-    \item Discount factor $\gamma$; shared learning rate $\alpha$
-    \item Scalar Q-function $Q_\theta(x) = W_Q\, u_x \in \mathbb{R}$, a linear projection of the last-token activation of $x$
-    \item Gradient clipping threshold $G$ (max global norm; all gradient steps are clipped to $\|\nabla\| \le G$)
+    \item Value vector $w \in \mathbb{R}^{d_\phi}$, living in the same embedding space as $\phi$
+    \item Boltzmann temperature $\beta > 0$ controlling exploration
+    \item Learning rate $\alpha$ for the LM gradient step; learning rate $\eta$ for the value regression step
+    \item Reward scaling factor $c$ (raw rewards $r_k \sim O(10^{-3})$ are multiplied by $c$ before value regression)
+    \item Gradient clipping threshold $G$ (max global norm; all LM gradient steps are clipped to $\|\nabla\| \le G$)
 \end{itemize}
-
-\noindent\textbf{Simplification.}  In practice we optionally fix $\sigma^2 = 1$ (ignoring $W_\gamma$), reducing the policy to a learned mean in embedding space with unit-variance Gaussian weighting.  This stabilises early training when the learned variance can be poorly calibrated.
 
 \subsection{Data Streaming}\label{sec:streaming}
 
-Data streams in continuously. For approximately every 1000 data points that arrive:
+Data streams in continuously. At each outer step, a fresh batch of context windows arrives and is partitioned:
 \begin{itemize}[nosep]
     \item $\sim$900 become training candidates (the set $S_t$ at outer step $t$)
-    \item $\sim$100 are reserved for held-out evaluation (the set $D_t$ at outer step $t$)
+    \item $\sim$400 are reserved for held-out evaluation (the set $D_t$ at outer step $t$)
 \end{itemize}
 
 Each incoming data point $x$ is embedded via an off-the-shelf embedding model: $e_x = \phi(x)$. These embeddings are used for the selection mechanism described below.
@@ -49,174 +47,52 @@ Each element of $S_t$ or $D_t$ is conceptually one full transformer context wind
 
 \subsection{Algorithm}
 
-At each outer-loop stream step $t$, we refresh $S_t, D_t$ from newly arrived data and hold them fixed for the duration of the inner loop.  We then run $K$ inner-loop steps on fixed $S_t, D_t$ to update $\theta$.
+The algorithm alternates two update steps---coordinate descent on the free energy.  At each outer-loop stream step $t$, we refresh $S_t, D_t$ from newly arrived data and hold them fixed for the duration of the inner loop.  We then run $K$ inner-loop steps on fixed $S_t, D_t$.
+
+The policy over training candidates is the Boltzmann distribution:
+\begin{equation}
+    \pi(x) = \operatorname{softmax}\!\Bigl(\frac{w \cdot \phi(x)}{\beta}\Bigr), \qquad x \in S_t,
+\end{equation}
+where $w \in \mathbb{R}^{d_\phi}$ is a learned value vector in embedding space and $\beta$ is the temperature.  The estimated value of candidate $x$ is $V(x) = w \cdot \phi(x)$.
+
+At initialisation, $w = 0$, so the policy is uniform over $S_t$.  The value vector is updated by online linear regression toward observed rewards, causing the policy to concentrate on candidates predicted to yield high held-out improvement.
+
+Each inner step $k$ proceeds as follows:
 
 \begin{enumerate}[nosep]
-    \item \textbf{Select a training example.}
-    Let $z_k = f_{\theta_k}^{(L-1)}(\texttt{<s>})$ be the second-to-last residual-stream activation at the \texttt{<s>} token under the current weights $\theta_k$.
-    The Gaussian parameters in embedding space are:
-    \begin{align}
-        \mu_k &= W_\mu\, z_k \;\in\; \mathbb{R}^{d_\phi},\\
-        \log \sigma_k^2 &= W_\gamma\, z_k \;\in\; \mathbb{R}^{d_\phi}.
-    \end{align}
-    This Gaussian $\mathcal{N}(\mu_k, \operatorname{diag}(\sigma_k^2))$ over the embedding space induces a distribution over $S_t$ by normalising the density at each candidate's embedding:
-    \begin{equation}
-        \pi_{\theta_k}(x) = \frac{\mathcal{N}\!\bigl(\phi(x);\;\mu_k,\;\operatorname{diag}(\sigma_k^2)\bigr)}
-        {\sum_{x' \in S_t} \mathcal{N}\!\bigl(\phi(x');\;\mu_k,\;\operatorname{diag}(\sigma_k^2)\bigr)},
-        \qquad x \in S_t.
-    \end{equation}
-    We sample a single example $x_k \sim \pi_{\theta_k}$ (with replacement from $S_t$).
+    \item \textbf{Select a training example (E-step).}
+    Sample $x_k \sim \pi$ from the candidates $S_t$ using the current value vector $w$.
 
-    \item \textbf{Language-modeling update (state transition).}
+    \item \textbf{Language-modeling update (M-step).}
     \begin{equation}
         \theta_{k+1} = \theta_k + \alpha\, \nabla_{\theta_k} \log p_{\theta_k}(x_k).
     \end{equation}
-    This is the state transition of the MDP: the action $x_k$ determines how the weights change, and $\theta_{k+1}$ becomes the state for the next inner step.  We retain both $\theta_k$ and $\theta_{k+1}$ in memory.
+    This is a standard gradient ascent step on the log-likelihood of the selected example.  Note that we only need to cache the held-out log-probability $\frac{1}{|D_t|}\log p_{\theta_k}(D_t)$ from the previous step, not the full parameter snapshot $\theta_k$.
 
     \item \textbf{Reward.}
+    The reward is the one-step held-out improvement:
     \begin{equation}
         r_k = \frac{1}{|D_t|}\log p_{\theta_{k+1}}(D_t) - \frac{1}{|D_t|}\log p_{\theta_k}(D_t).
     \end{equation}
+    In practice, $r_k$ is scaled by a constant $c$ (since raw $r_k \sim O(10^{-3})$) before the value update.
 
-    \item \textbf{Q-value of selected example.}
-    The state in this MDP is $\theta_k$ and the action is $x_k$.
-    The Q-function estimates the \emph{discounted future expected return} from selecting $x_k$ in state $\theta_k$ and following the policy thereafter.
-    We obtain $u_k$ as a byproduct of the forward pass on $x_k$ under $\theta_{k+1}$ used to compute $\log p_{\theta_{k+1}}(D_t)$ in step~3 (specifically, $u_k = f_{\theta_{k+1}}^{(L-1)}(x_k^{\text{last}})$, the second-to-last residual-stream activation at the last token of $x_k$).  Then:
+    \item \textbf{Value vector regression.}
+    Update $w$ by online linear regression toward the observed (scaled) reward:
     \begin{equation}
-        Q_{\theta_k}(x_k) = W_Q\, u_k \;\in\; \mathbb{R}.
+        w \;\leftarrow\; w - \eta\,\bigl(w \cdot \phi(x_k) - c\, r_k\bigr)\,\phi(x_k).
     \end{equation}
-
-    \item \textbf{Next-state value (Bellman target).}
-    We sample a batch of $M$ candidates $\{x^{(j)}\}_{j=1}^{M} \sim \pi_{\theta_{k+1}}$ from $S_t$ and estimate:
-    \begin{equation}
-        V_{k+1} \approx \frac{1}{M}\sum_{j=1}^{M} Q_{\theta_{k+1}}(x^{(j)}).
-    \end{equation}
-
-    \item \textbf{Baseline value.}
-    We sample a batch of $M$ candidates $\{x^{(j)}\}_{j=1}^{M} \sim \pi_{\theta_k}$ from $S_t$ and estimate:
-    \begin{equation}
-        V_k \approx \frac{1}{M}\sum_{j=1}^{M} Q_{\theta_k}(x^{(j)}).
-    \end{equation}
-    Since $W_Q$ is a single linear projection, evaluating $Q$ on each sampled candidate is cheap.
-
-    \item \textbf{Combined loss and update.}
-    The Bellman regression loss for the Q-function is:
-    \begin{align}
-        y_k &= r_k + \gamma\;\operatorname{sg}(V_{k+1}), \\
-        L_Q &= \bigl(Q_{\theta_k}(x_k) - y_k\bigr)^2,
-    \end{align}
-    where $\operatorname{sg}(\cdot)$ denotes stop-gradient: we do not back-propagate through $\theta_{k+1}$ or the $Q$ values in the target, but we \emph{do} back-propagate into $W_Q$ (and the backbone that produces $u_k$) on the left-hand side.
-
-    The policy-gradient loss uses the advantage $A_k = \operatorname{sg}\!\bigl(Q_{\theta_k}(x_k) - V_k\bigr)$:
-    \begin{equation}
-        L_\pi = -A_k \log \pi_{\theta_k}(x_k).
-    \end{equation}
-    Gradients of $L_\pi$ flow through $\pi_{\theta_k}(x_k)$ into $W_\mu$, $W_\gamma$, and the backbone (via $z_k$).
-
-    \textbf{Implementation note.}
-    Computing $L_\pi$ requires $\nabla_{\theta_k} \log \pi_{\theta_k}(x_k)$, but $A_k$ is only available after the LM step (step~2) has advanced parameters to $\theta_{k+1}$.
-    The implementation resolves this by snapshotting $\theta_k$ before the LM step.
-    $L_Q$ is computed at $\theta_{k+1}$ (since $u_k = f_{\theta_{k+1}}^{(L-1)}(x_k^{\text{last}})$), then $\theta_k$ is temporarily restored to compute $\nabla_{\theta_k} L_\pi$ exactly, and finally $\theta_{k+1}$ is restored before the combined gradient step.
-
-    The total loss for one inner step is:
-    \begin{equation}
-    \boxed{\;L_k = L_Q + L_\pi\;}
-    \end{equation}
-    The gradient $\nabla L_Q$ is evaluated at $\theta_{k+1}$ and $\nabla L_\pi$ at $\theta_k$; both are summed and applied as a single update to $\theta_{k+1}$.  The language-modeling update (step~2) is applied separately as the MDP state transition.
+    This drives the predicted value $w \cdot \phi(x_k)$ toward the observed reward, so that future sampling via $\pi$ favours candidates whose embeddings are similar to those that previously yielded high held-out improvement.
 \end{enumerate}
 
-\subsection{Architecture}
+\noindent\textbf{Key simplifications.}  This formulation requires no Q-function, no value baseline, no Bellman loss, no parameter snapshots, and no backpropagation through the selection policy.  The value vector $w$ is updated by a closed-form regression step that is decoupled from the LM optimiser.  The only neural-network gradient computation is the standard LM training step (step~2).
 
-Let $L$ be the number of transformer layers.  All activations used by the policy and Q-function are read from the second-to-last residual-stream layer ($\ell = L-1$).
+\subsection{Interpretation as Free-Energy Minimisation}
 
-\begin{itemize}[nosep]
-    \item \textbf{Policy state:} $z = f_\theta^{(L-1)}(\texttt{<s>}) \in \mathbb{R}^{d}$, the activation at the start token.
-    \item \textbf{Policy head:} $\mu = W_\mu\, z \in \mathbb{R}^{d_\phi}$, $\log \sigma^2 = W_\gamma\, z \in \mathbb{R}^{d_\phi}$.  The Gaussian $\mathcal{N}(\mu, \operatorname{diag}(\sigma^2))$ in embedding space is normalised over $S_t$ to give $\pi_\theta(x)$.
-    \item \textbf{Q head:} $Q_\theta(x) = W_Q\, u_x \in \mathbb{R}$, where $u_x = f_\theta^{(L-1)}(x^{\text{last}})$ is the activation at the last token of context window $x$.
-\end{itemize}
-
-The state-value baseline $V$ is estimated by sampling $M$ candidates from $\pi$ and averaging their $Q$ values, yielding the advantage $A = Q_\theta(x) - V$.
-
-\subsection{Alternative: Unified Meta-Learning Objective}\label{sec:unified}
-
-The algorithm in Section~2.3 treats the language-modeling update as an opaque MDP transition and uses a learned Q-function to estimate the value of selecting each training example.  An alternative is to \emph{differentiate through} the LM update itself, yielding a single objective that subsumes both the data-selection policy and the training step.
-
-\subsubsection{Myopic formulation ($\gamma = 0$)}
-
-Define the one-step \emph{meta-objective}:
-\begin{equation}\label{eq:meta-obj}
-    J(\theta) \;=\; \mathbb{E}_{x \sim \pi_\theta}\!\Bigl[\,
-        \tfrac{1}{|D_t|}\,\log p_{\,\theta'}(D_t)
-    \,\Bigr],
-    \qquad
-    \theta' \;=\; \theta + \alpha\,\nabla_\theta \log p_\theta(x).
+The Boltzmann policy $\pi(x) \propto \exp(w \cdot \phi(x) / \beta)$ can be viewed as the solution to a free-energy minimisation problem:
+\begin{equation}
+    \pi^* = \arg\min_\pi \;\Bigl[\; -\mathbb{E}_{x \sim \pi}\bigl[V(x)\bigr] + \beta\, H(\pi) \;\Bigr],
 \end{equation}
-This says: select $x$ to maximise the held-out log-probability of the model obtained after one gradient step on~$x$.  Because $\theta'$ is a differentiable function of~$\theta$ (and of the choice of~$x$), we can compute $\nabla_\theta J$ by back-propagating through the inner gradient step.
-
-The gradient decomposes into two terms.  Because $x$ is drawn from a discrete distribution over $S_t$, we cannot reparameterise through the sampling; the score-function (REINFORCE) estimator gives:
-\begin{equation}\label{eq:meta-grad}
-    \nabla_\theta J
-    \;=\;
-    \mathbb{E}_{x \sim \pi_\theta}\!\Bigl[\,
-        \underbrace{%
-            \nabla_\theta\!\Bigl(\tfrac{1}{|D_t|}\log p_{\theta'}(D_t)\Bigr)\Bigr|_{\text{through }\theta'}
-        }_{\text{pathwise (chain-rule) term}}
-        \;+\;
-        \underbrace{%
-            \Bigl(\tfrac{1}{|D_t|}\log p_{\theta'}(D_t) - b\Bigr)\,
-            \nabla_\theta \log \pi_\theta(x)
-        }_{\text{score-function (REINFORCE) term}}
-    \,\Bigr],
-\end{equation}
-where $b$ is any baseline that does not depend on~$x$ (e.g.\ a running mean of the held-out log-prob).  The pathwise term differentiates the held-out evaluation through the transition $\theta' = \theta + \alpha\,\nabla_\theta \log p_\theta(x)$, requiring a Hessian-vector product $\nabla^2_\theta \log p_\theta(x)$.
-
-\paragraph{Relation to the current algorithm.}
-Setting $\gamma = 0$ in the actor-critic formulation of Section~2.3 recovers the REINFORCE term of~\eqref{eq:meta-grad} (with $Q$ playing the role of the held-out improvement and $V$ as the baseline), but \emph{discards} the pathwise term.  The unified formulation therefore strictly dominates the $\gamma = 0$ actor-critic: it uses the same REINFORCE signal plus an additional low-variance gradient that flows through the LM transition.
-
-\paragraph{What the unified formulation eliminates.}
-Under~\eqref{eq:meta-obj} the Q-function, value baseline, Bellman loss, and the $\theta_k$-snapshot machinery are all unnecessary.  The entire RL apparatus (steps~4--7) is replaced by a single backward pass through the meta-objective.  This substantially simplifies the algorithm and removes the need for the two-phase gradient computation described in the implementation note of Section~2.3.
-
-\subsubsection{Multi-step extension ($\gamma > 0$)}
-
-The myopic objective~\eqref{eq:meta-obj} optimises only the immediate one-step improvement.  To recover multi-step lookahead, one can unroll $K$ inner steps and optimise the cumulative discounted held-out improvement:
-\begin{equation}\label{eq:meta-multistep}
-    J_K(\theta_0) \;=\; \mathbb{E}\!\Biggl[\,\sum_{k=0}^{K-1} \gamma^k\,
-        \tfrac{1}{|D_t|}\,\log p_{\theta_{k+1}}(D_t)
-    \,\Biggr],
-    \qquad
-    \theta_{k+1} = \theta_k + \alpha\,\nabla_{\theta_k} \log p_{\theta_k}(x_k),
-    \quad
-    x_k \sim \pi_{\theta_k}.
-\end{equation}
-Differentiating through the full unrolling is the MAML-style approach (Finn et al., 2017).  This is exact but requires $O(K)$ memory for the intermediate parameter snapshots and $O(K)$ Hessian-vector products during the backward pass.
-
-A practical middle ground is the \textbf{hybrid} approach: use the differentiable one-step objective for the immediate reward (capturing the pathwise gradient through the LM transition), and retain the Q-function only for estimating the discounted future return beyond one step:
-\begin{equation}\label{eq:hybrid}
-    L_{\text{hybrid}} \;=\;
-    -\,\tfrac{1}{|D_t|}\,\log p_{\theta'}(D_t)
-    \;-\; \operatorname{sg}(A_k)\,\log \pi_\theta(x_k),
-\end{equation}
-where $\theta' = \theta + \alpha\,\nabla_\theta \log p_\theta(x_k)$ and $A_k$ is the multi-step advantage from the Q-function.  The first term provides the exact one-step pathwise gradient; the second provides the REINFORCE correction for long-horizon effects.
-
-\subsubsection{Tradeoffs}
-
-\begin{table}[h]
-\centering
-\begin{tabular}{@{}lccc@{}}
-\toprule
-\textbf{Formulation} & \textbf{Q / V needed?} & \textbf{Second-order?} & \textbf{Multi-step?} \\
-\midrule
-Actor-critic (current, \S2.3) & Yes & No & Yes (via $\gamma$, $Q$) \\
-Unified myopic~\eqref{eq:meta-obj} & No & Yes (Hessian-vec) & No \\
-Hybrid~\eqref{eq:hybrid} & Yes (future only) & Yes & Yes \\
-Full unrolling~\eqref{eq:meta-multistep} & No & Yes ($K\times$) & Yes (exact) \\
-\bottomrule
-\end{tabular}
-\caption{Comparison of objective formulations.  ``Second-order'' refers to the need for Hessian-vector products from differentiating through the LM gradient step.  For GPT-2 small, one Hessian-vector product costs roughly $2\times$ a standard backward pass; PyTorch supports this via \texttt{create\_graph=True}.}
-\label{tab:formulations}
-\end{table}
-
-The unified myopic formulation is the simplest and eliminates all auxiliary RL machinery.  Its cost is one Hessian-vector product per inner step (${\sim}2\times$ backward) and the loss of multi-step lookahead.  Whether the pathwise gradient or the multi-step Q-estimate contributes more to learning quality is an empirical question; the current implementation uses the actor-critic formulation, with the unified objective as a planned future experiment.
+where $H(\pi)$ is the entropy of the selection distribution.  The first term encourages selecting high-value candidates; the second (controlled by $\beta$) encourages exploration.  The value regression step (step~4) updates $V(x) = w \cdot \phi(x)$ to better predict which candidates yield held-out improvement, and the Boltzmann form automatically adjusts the policy accordingly.
 
 \section{Evaluation}
 
@@ -245,8 +121,8 @@ We will measure:
 Beyond aggregate metrics, we will examine:
 \begin{itemize}[nosep]
     \item \textbf{Curriculum structure:} Does the learned curriculum exhibit interpretable patterns? Developmental stages? Topic clustering?
-    \item \textbf{Exploration dynamics:} How does $\sigma$ evolve over training? Does the learned variance produce reasonable exploration?
-    \item \textbf{Q-function interpretability:} What does $Q_\theta(x)$ learn to predict? Can we understand what makes a training example ``valuable''?
+    \item \textbf{Exploration dynamics:} How does the policy entropy evolve over training? Does the Boltzmann temperature $\beta$ produce reasonable exploration?
+    \item \textbf{Value vector interpretability:} What directions does $w$ learn? Can we understand what makes a training example ``valuable'' by examining $w \cdot \phi(x)$ across candidates?
 \end{itemize}
 
 \section{Relation to Prior Work}

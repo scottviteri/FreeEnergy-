@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Asynchronous log plotter for curriculum RL training.
+Asynchronous log plotter for free-energy curriculum training.
 
-Reads checkpoints/log.jsonl periodically and generates plots.
+Reads checkpoints/log.jsonl periodically and generates plots for the
+free-energy soft-value formulation (no Q-functions, Bellman losses, or
+policy gradients - just value vector regression).
+
 Can be edited and re-run mid-training -- it reads the log file fresh each time.
 
 Usage:
@@ -304,25 +307,29 @@ def plot_weight_norms(steps, evals, out_dir):
 
 
 def plot_policy_stats(steps, evals, out_dir):
-    """Policy entropy, effective N, sigma2 statistics."""
+    """Policy entropy, effective N, and value vector statistics (free-energy formulation)."""
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Policy Distribution Diagnostics", fontsize=14, fontweight="bold")
+    fig.suptitle("Policy & Value Vector Diagnostics", fontsize=14, fontweight="bold")
 
     # Entropy
     ax = axes[0, 0]
     xs, ys = get(steps, "pi_entropy")
     if xs:
         ax.plot(xs, ys, color="C0", linewidth=1)
-    ax.set_title("Policy Entropy H(pi)")
+        ax.axhline(np.log(900), color="gray", linestyle="--", linewidth=0.5, label="log(|S_t|)")
+    ax.set_title("Policy Entropy H(π)")
     ax.set_xlabel("global step")
+    ax.legend(fontsize=8)
 
     # Effective N
     ax = axes[0, 1]
     xs, ys = get(steps, "pi_effective_n")
     if xs:
         ax.plot(xs, ys, color="C1", linewidth=1)
+        ax.axhline(900, color="gray", linestyle="--", linewidth=0.5, label="|S_t|")
     ax.set_title("Effective N = exp(H)")
     ax.set_xlabel("global step")
+    ax.legend(fontsize=8)
 
     # Max/min prob
     ax = axes[1, 0]
@@ -332,33 +339,86 @@ def plot_policy_stats(steps, evals, out_dir):
         ax.plot(xs_max, ys_max, color="C3", linewidth=1, label="max")
     if xs_min:
         ax.plot(xs_min, ys_min, color="C4", linewidth=1, label="min")
+    ax.axhline(1.0/900, color="gray", linestyle="--", linewidth=0.5, label="uniform")
     ax.set_title("Policy Prob Range")
     ax.set_xlabel("global step")
     ax.set_yscale("log")
     ax.legend(fontsize=8)
 
-    # Sigma2 stats (only present when fix_sigma=False)
+    # Value vector norm
     ax = axes[1, 1]
-    xs_mean, ys_mean = get(steps, "sigma2_mean")
-    if xs_mean:
-        xs_min2, ys_min2 = get(steps, "sigma2_min")
-        xs_max2, ys_max2 = get(steps, "sigma2_max")
-        ax.plot(xs_mean, ys_mean, color="C0", linewidth=1.5, label="mean")
-        if xs_min2:
-            ax.plot(xs_min2, ys_min2, color="C1", linewidth=0.8, label="min", alpha=0.7)
-        if xs_max2:
-            ax.plot(xs_max2, ys_max2, color="C2", linewidth=0.8, label="max", alpha=0.7)
-        ax.set_title("sigma^2 Statistics")
-        ax.set_yscale("log")
-        ax.legend(fontsize=8)
-    else:
-        ax.text(0.5, 0.5, "sigma^2 fixed at 1.0\n(--fix_sigma)",
-                transform=ax.transAxes, ha="center", va="center", fontsize=12, color="gray")
-        ax.set_title("sigma^2 (fixed)")
+    xs_norm, ys_norm = get(steps, "w_norm")
+    if xs_norm:
+        ax.plot(xs_norm, ys_norm, color="C0", linewidth=1.5, label="||w||")
+    ax.set_title("Value Vector Norm ||w||")
     ax.set_xlabel("global step")
+    ax.legend(fontsize=8)
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_dir / "07_policy_stats.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_value_vector_analysis(steps, evals, out_dir):
+    """Value vector regression analysis (free-energy soft-value formulation)."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Value Vector Regression Analysis", fontsize=14, fontweight="bold")
+
+    win = lambda ys: min(20, max(1, len(ys)//5))
+
+    # Value prediction vs reward
+    ax = axes[0, 0]
+    xs_pred, ys_pred = get(steps, "value_pred")
+    xs_rew, ys_rew = get(steps, "r_k")
+    if xs_pred and xs_rew:
+        # Scatter plot (downsampled if too many points)
+        step = max(1, len(xs_pred) // 500)
+        ax.scatter(ys_pred[::step], ys_rew[::step], s=3, alpha=0.3, c="C0")
+        # Diagonal line (perfect prediction)
+        all_vals = ys_pred + ys_rew
+        vmin, vmax = min(all_vals), max(all_vals)
+        ax.plot([vmin, vmax], [vmin, vmax], 'r--', linewidth=1, label="perfect prediction")
+        ax.set_xlabel("Predicted value w·φ(x)")
+        ax.set_ylabel("Observed reward r_k")
+        ax.legend(fontsize=8)
+    ax.set_title("Value Prediction Accuracy")
+
+    # Value error over time
+    ax = axes[0, 1]
+    xs, ys = get(steps, "value_error")
+    if xs:
+        ax.plot(xs, ys, alpha=0.3, color="C1", linewidth=0.5)
+        sx, sy = smooth_xy(xs, ys, win(ys))
+        ax.plot(sx, sy, color="C1", linewidth=1.5, label="smoothed")
+        ax.axhline(0, color="gray", linestyle="--", linewidth=0.5)
+    ax.set_title("Value Error (pred - reward)")
+    ax.set_xlabel("global step")
+    ax.set_ylabel("w·φ(x_k) - r_k")
+    ax.legend(fontsize=8)
+
+    # w_norm and reward_ema
+    ax = axes[1, 0]
+    xs_w, ys_w = get(steps, "w_norm")
+    if xs_w:
+        ax.plot(xs_w, ys_w, color="C2", linewidth=1.5, label="||w||")
+    ax.set_title("Value Vector Norm")
+    ax.set_xlabel("global step")
+    ax.set_ylabel("||w||")
+    ax.legend(fontsize=8)
+
+    # Reward EMA
+    ax = axes[1, 1]
+    xs, ys = get(steps, "reward_ema")
+    if xs:
+        ax.plot(xs, ys, color="C3", linewidth=1.5, label="EMA(r_k)")
+        ax.axhline(0, color="gray", linestyle="--", linewidth=0.5)
+    ax.set_title("Reward Exponential Moving Average")
+    ax.set_xlabel("global step")
+    ax.set_ylabel("EMA(r_k)")
+    ax.legend(fontsize=8)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_dir / "14_value_vector_analysis.png", dpi=150)
     plt.close(fig)
 
 
@@ -682,9 +742,9 @@ def plot_selection_per_outer(steps, evals, out_dir):
 # ---------------------------------------------------------------------------
 
 def plot_dashboard(steps, evals, out_dir):
-    """All-in-one 4x4 dashboard: 16 panels in a single image."""
+    """All-in-one 4x4 dashboard for free-energy soft-value formulation."""
     fig, axes = plt.subplots(4, 4, figsize=(28, 20))
-    fig.suptitle("Training Dashboard", fontsize=18, fontweight="bold")
+    fig.suptitle("Free-Energy Curriculum Training Dashboard", fontsize=18, fontweight="bold")
 
     win = lambda ys: min(30, max(1, len(ys) // 10))
 
@@ -711,61 +771,48 @@ def plot_dashboard(steps, evals, out_dir):
         ax.set_title(title, fontsize=9)
         ax.tick_params(labelsize=7)
 
-    # Row 0: core metrics
-    _plot(axes[0, 0], "r_k", "Reward (scaled r_k)", "C0", hline=0)
-    _plot(axes[0, 1], "cumulative_reward", "Cumulative Reward (raw)", "C3")
+    # Row 0: core reward and held-out metrics
+    _plot(axes[0, 0], "r_k", "Reward r_k (scaled)", "C0", hline=0)
+    _plot(axes[0, 1], "r_k_raw", "Raw Reward (unscaled)", "C5", hline=0)
     _plot(axes[0, 2], "heldout_lp", "Held-out Log-Prob", "C1")
-    _plot(axes[0, 3], "lm_loss", "LM Loss (selected x_k)", "C2")
+    _plot(axes[0, 3], "cumulative_reward", "Cumulative Reward (raw)", "C3")
 
-    # Row 1: eval + RL values
+    # Row 1: eval + LM metrics
     _plot(axes[1, 0], "perplexity", "Eval Perplexity", "C4", src="eval")
-    _plot(axes[1, 1], "q_xk", "Q(x_k)", "C0", hline=0)
-    _plot(axes[1, 2], "A_k", "Advantage A_k", "C3", hline=0)
-    _plot(axes[1, 3], "V_k", "Baseline V_k", "C1")
+    _plot(axes[1, 1], "lm_loss", "LM Loss (selected x_k)", "C2")
+    _plot(axes[1, 2], "lm_grad_total", "LM Grad Norm", "C0", log_y=True)
+    _plot(axes[1, 3], "step_time", "Step Time (s)", "C2")
 
-    # Row 2: losses + grad norms
-    _plot(axes[2, 0], "L_Q", "Bellman Loss L_Q", "C0", log_y=True)
-    _plot(axes[2, 1], "L_pi", "Policy Loss L_pi", "C1")
-    _plot(axes[2, 2], "lm_grad_total", "LM Grad Norm", "C0", log_y=True)
-    _plot(axes[2, 3], "rl_grad_total", "RL Grad Norm", "C3", log_y=True)
+    # Row 2: value vector analysis
+    _plot(axes[2, 0], "w_norm", "Value Vector ||w||", "C0")
+    _plot(axes[2, 1], "w_mean", "Value Vector mean(w)", "C1")
+    _plot(axes[2, 2], "value_pred", "Predicted Value w·φ(x_k)", "C2", hline=0)
+    _plot(axes[2, 3], "value_error", "Value Error (pred - r_k)", "C3", hline=0)
 
-    # Row 3: policy + timing + weights
-    _plot(axes[3, 0], "pi_entropy", "Policy Entropy H(pi)", "C0")
+    # Row 3: policy distribution
+    _plot(axes[3, 0], "pi_entropy", "Policy Entropy H(π)", "C0")
     _plot(axes[3, 1], "pi_effective_n", "Effective N = exp(H)", "C1")
-    _plot(axes[3, 2], "step_time", "Step Time (s)", "C2")
-
-    # Weight norms (multiple lines)
-    ax = axes[3, 3]
-    for key, label, color in [
-        ("wnorm_W_mu", "W_mu", "C0"),
-        ("wnorm_W_Q", "W_Q", "C2"),
-    ]:
-        xs, ys = get(steps, key)
-        if xs:
-            ax.plot(xs, ys, linewidth=1, color=color, label=label)
-    ax.set_title("Weight Norms", fontsize=9)
-    ax.legend(fontsize=6)
-    ax.tick_params(labelsize=7)
+    _plot(axes[3, 2], "pi_max_prob", "Policy Max Prob", "C2", log_y=True)
+    _plot(axes[3, 3], "reward_ema", "Reward EMA", "C4", hline=0)
 
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(out_dir / "00_dashboard.png", dpi=150)
     plt.close(fig)
 
 
+# Plotters relevant for free-energy soft-value branch
+# (Removed: plot_rl_losses, plot_q_values, plot_gradient_norms, 
+#  plot_weight_norms, plot_grad_norms_detail - not applicable to this formulation)
 ALL_PLOTTERS = [
     plot_dashboard,
     plot_core_metrics,
     plot_eval_perplexity,
-    plot_rl_losses,
-    plot_q_values,
-    plot_gradient_norms,
-    plot_weight_norms,
     plot_policy_stats,
+    plot_value_vector_analysis,
     plot_timing,
     plot_reward_distribution,
     plot_selected_data,
     plot_selection_per_outer,
-    plot_grad_norms_detail,
     plot_outer_step_timing,
 ]
 
