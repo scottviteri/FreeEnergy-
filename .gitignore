@@ -4,3 +4,11 @@
 *.aux
 checkpoints/
 plots/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+node_modules/
+.venv/
+venv/
+.DS_Store
